@@ -186,6 +186,9 @@ ALPHAESS_VERIFY_SSL = _env_bool("ALPHAESS_VERIFY_SSL", True)
 ALPHAESS_PBAT_POSITIVE_IS_CHARGE = _env_bool("ALPHAESS_PBAT_POSITIVE_IS_CHARGE", True)
 ALPHAESS_PGRID_POSITIVE_IS_IMPORT = _env_bool("ALPHAESS_PGRID_POSITIVE_IS_IMPORT", True)
 
+# AlphaESS idle/charge detection
+ALPHAESS_PBAT_IDLE_THRESHOLD_W = _env_int("ALPHAESS_PBAT_IDLE_THRESHOLD_W", 50)
+
 # AlphaESS polling behaviour
 ALPHAESS_MIN_POLL_INTERVAL_SEC = _env_int("ALPHAESS_MIN_POLL_INTERVAL_SEC", 5)
 ALPHAESS_POLL_TIMEOUT_SEC = _env_float("ALPHAESS_POLL_TIMEOUT_SEC", 12.0)
@@ -194,6 +197,14 @@ ALPHAESS_MAX_STALE_SEC = _env_int("ALPHAESS_MAX_STALE_SEC", 30)
 # Grid feedback tuning
 ALPHAESS_GRID_FEEDBACK_GAIN = _env_float("ALPHAESS_GRID_FEEDBACK_GAIN", 1.0)
 ALPHAESS_GRID_IMPORT_BIAS_W = _env_int("ALPHAESS_GRID_IMPORT_BIAS_W", 50)
+
+# When export is costing money (feed-in price > threshold), it can be useful to
+# deliberately leave headroom for the battery to *start* charging (self-consumption mode).
+# If SOC is below this threshold, we assume the battery can absorb up to AUTO_CHARGE_W.
+# Set AUTO_CHARGE_W=0 to disable this behaviour.
+ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT = _env_float("ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT", 90.0)
+ALPHAESS_AUTO_CHARGE_W = _env_int("ALPHAESS_AUTO_CHARGE_W", 1500)
+ALPHAESS_AUTO_CHARGE_MAX_W = _env_int("ALPHAESS_AUTO_CHARGE_MAX_W", 3000)
 
 # -------------------- Amber --------------------
 
@@ -1161,7 +1172,7 @@ class AlphaEssOpenApiPoller:
                 # Normalise pBat sign so + means charging, - means discharging
                 if pbat is not None:
                     snap.pbat_w = pbat if ALPHAESS_PBAT_POSITIVE_IS_CHARGE else -pbat
-                    if abs(snap.pbat_w) < 50:
+                    if abs(snap.pbat_w) < int(ALPHAESS_PBAT_IDLE_THRESHOLD_W):
                         snap.batt_state = "idle"
                     elif snap.pbat_w > 0:
                         snap.batt_state = "charging"
@@ -1215,6 +1226,12 @@ def main() -> int:
         f"alphaess_openapi_enabled={ALPHAESS_OPENAPI_ENABLED} "
         f"alphaess_keys={'set' if (ALPHAESS_APP_ID and ALPHAESS_APP_SECRET and ALPHAESS_APP_ID != '...') else 'missing'}"
     )
+    print(
+        f"[start] alphaess_idle_threshold={ALPHAESS_PBAT_IDLE_THRESHOLD_W}W "
+        f"auto_charge_below_soc={ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT}% "
+        f"auto_charge_w={ALPHAESS_AUTO_CHARGE_W}W auto_charge_max_w={ALPHAESS_AUTO_CHARGE_MAX_W}W"
+    )
+
 
     amber = AmberClient(AMBER_SITE_ID, AMBER_API_KEY)
     amber_poller = AmberPoller(
@@ -1370,7 +1387,29 @@ def main() -> int:
                         target_w = 0
                         target_reason = "alpha_stale" if alpha_poller else "alpha_disabled"
                     else:
-                        base_w = int(max(0, (alpha_snap.pload_w or 0) + int(alpha_snap.charge_w)))
+                        pload_w = int(alpha_snap.pload_w or 0)
+                        measured_charge_w = int(alpha_snap.charge_w or 0)
+                        desired_charge_w = int(measured_charge_w)
+
+                        # If the battery is low and currently "idle", we still want to leave
+                        # enough PV headroom for it to begin charging (self-consumption mode).
+                        auto_add_w = 0
+                        if (
+                            alpha_snap.soc_pct is not None
+                            and ALPHAESS_AUTO_CHARGE_W > 0
+                            and ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT > 0
+                        ):
+                            try:
+                                soc = float(alpha_snap.soc_pct)
+                            except Exception:
+                                soc = None
+                            if soc is not None and soc < float(ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT):
+                                cap = int(max(0, min(int(ALPHAESS_AUTO_CHARGE_W), int(ALPHAESS_AUTO_CHARGE_MAX_W))))
+                                if cap > desired_charge_w:
+                                    auto_add_w = int(cap - desired_charge_w)
+                                    desired_charge_w = int(cap)
+
+                        base_w = int(max(0, pload_w + desired_charge_w))
                         target_w_f = float(base_w)
 
                         if alpha_snap.pgrid_w is not None:
@@ -1382,7 +1421,7 @@ def main() -> int:
                             target_w_f -= float(ALPHAESS_GRID_IMPORT_BIAS_W)
 
                         target_w = int(round(max(0.0, min(float(GOODWE_RATED_W), target_w_f))))
-                        target_reason = f"pload={alpha_snap.pload_w}W charge={alpha_snap.charge_w}W"
+                        target_reason = f"pload={pload_w}W charge={desired_charge_w}W" + (f"(auto+{auto_add_w}W)" if auto_add_w else "")
                 else:
                     target_w = int(GOODWE_RATED_W)
                     target_reason = "export_allowed"
