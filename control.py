@@ -210,7 +210,7 @@ ALPHAESS_FULL_SOC_PCT = _env_float("ALPHAESS_FULL_SOC_PCT", 99.5)
 # before we start backing the GoodWe off (helps the battery begin charging / avoid oscillation).
 ALPHAESS_EXPORT_ALLOW_W_BELOW_FULL_SOC = _env_int("ALPHAESS_EXPORT_ALLOW_W_BELOW_FULL_SOC", 50)
 
-# When export would cost money (feed-in price < threshold), it can be useful to
+# When export would cost money (feed-in price > threshold), it can be useful to
 # deliberately leave headroom for the battery to *start* charging (self-consumption mode).
 # If SOC is below this threshold, we assume the battery can absorb up to AUTO_CHARGE_W.
 # Set AUTO_CHARGE_W=0 to disable this behaviour.
@@ -1513,7 +1513,7 @@ def main() -> int:
                         )
 
                 # Desired inverter power limit (W).
-                # If exporting to the grid would cost money (Amber feed-in price < threshold):
+                # If exporting to the grid would cost money (Amber feed-in price > threshold):
                 #   - If the Alpha battery is NOT full: allow the GoodWe to run at 100% until
                 #     grid export exceeds ALPHAESS_EXPORT_ALLOW_W_BELOW_FULL_SOC, then back off.
                 #   - If the battery is full (or SOC unknown): keep export near zero (bias to small import).
