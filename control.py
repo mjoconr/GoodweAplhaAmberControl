@@ -202,7 +202,15 @@ ALPHAESS_MAX_STALE_SEC = _env_int("ALPHAESS_MAX_STALE_SEC", 30)
 ALPHAESS_GRID_FEEDBACK_GAIN = _env_float("ALPHAESS_GRID_FEEDBACK_GAIN", 1.0)
 ALPHAESS_GRID_IMPORT_BIAS_W = _env_int("ALPHAESS_GRID_IMPORT_BIAS_W", 50)
 
-# When export is costing money (feed-in price > threshold), it can be useful to
+# Battery considered "full" at/above this SOC percentage.
+# Many systems only report SOC as an integer, so use 99.5 by default to treat 100% as full.
+ALPHAESS_FULL_SOC_PCT = _env_float("ALPHAESS_FULL_SOC_PCT", 99.5)
+
+# When export would cost money and the battery is NOT full, allow a small amount of export
+# before we start backing the GoodWe off (helps the battery begin charging / avoid oscillation).
+ALPHAESS_EXPORT_ALLOW_W_BELOW_FULL_SOC = _env_int("ALPHAESS_EXPORT_ALLOW_W_BELOW_FULL_SOC", 50)
+
+# When export would cost money (feed-in price < threshold), it can be useful to
 # deliberately leave headroom for the battery to *start* charging (self-consumption mode).
 # If SOC is below this threshold, we assume the battery can absorb up to AUTO_CHARGE_W.
 # Set AUTO_CHARGE_W=0 to disable this behaviour.
@@ -1345,7 +1353,9 @@ def main() -> int:
     print(
         f"[start] alphaess_idle_threshold={ALPHAESS_PBAT_IDLE_THRESHOLD_W}W "
         f"auto_charge_below_soc={ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT}% "
-        f"auto_charge_w={ALPHAESS_AUTO_CHARGE_W}W auto_charge_max_w={ALPHAESS_AUTO_CHARGE_MAX_W}W"
+        f"auto_charge_w={ALPHAESS_AUTO_CHARGE_W}W auto_charge_max_w={ALPHAESS_AUTO_CHARGE_MAX_W}W "
+        f"full_soc={ALPHAESS_FULL_SOC_PCT}% "
+        f"export_allow_below_full_soc={ALPHAESS_EXPORT_ALLOW_W_BELOW_FULL_SOC}W"
     )
 
     amber = AmberClient(AMBER_SITE_ID, AMBER_API_KEY)
@@ -1438,7 +1448,7 @@ def main() -> int:
 
                 # If Amber is stale/unavailable, be conservative: assume export may be costing money.
                 if amber_ok:
-                    export_costs = (feed_c is not None) and (float(feed_c) > float(EXPORT_COST_THRESHOLD_C))
+                    export_costs = (feed_c is not None) and (float(feed_c) < float(EXPORT_COST_THRESHOLD_C))
                     amber_state = "ok"
                 else:
                     export_costs = True
@@ -1502,52 +1512,86 @@ def main() -> int:
                             f"pload={pload_s} pbat={pbat_s} pgrid={pgrid_s})"
                         )
 
-                # Desired inverter power limit (W). When export is costing money, try to:
-                #   - cover house load (pLoad)
-                #   - plus AlphaESS battery charging load (pBat>0 after normalisation)
-                #   - while trimming any residual grid export/import using pGrid feedback.
+                # Desired inverter power limit (W).
+                # If exporting to the grid would cost money (Amber feed-in price < threshold):
+                #   - If the Alpha battery is NOT full: allow the GoodWe to run at 100% until
+                #     grid export exceeds ALPHAESS_EXPORT_ALLOW_W_BELOW_FULL_SOC, then back off.
+                #   - If the battery is full (or SOC unknown): keep export near zero (bias to small import).
                 if export_costs:
                     if not alpha_ok:
                         target_w = 0
                         target_reason = "alpha_stale" if alpha_poller else "alpha_disabled"
                     else:
-                        pload_w = int(alpha_snap.pload_w or 0)
-                        measured_charge_w = int(alpha_snap.charge_w or 0)
-                        desired_charge_w = int(measured_charge_w)
+                        soc = alpha_snap.soc_pct
+                        batt_not_full = (soc is not None) and (float(soc) < float(ALPHAESS_FULL_SOC_PCT))
 
-                        # If the battery is low and currently "idle", we still want to leave
-                        # enough PV headroom for it to begin charging (self-consumption mode).
-                        auto_add_w = 0
-                        if (
-                            alpha_snap.soc_pct is not None
-                            and ALPHAESS_AUTO_CHARGE_W > 0
-                            and ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT > 0
-                        ):
-                            try:
-                                soc = float(alpha_snap.soc_pct)
-                            except Exception:
-                                soc = None
-                            if soc is not None and soc < float(ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT):
-                                cap = int(max(0, min(int(ALPHAESS_AUTO_CHARGE_W), int(ALPHAESS_AUTO_CHARGE_MAX_W))))
-                                if cap > desired_charge_w:
-                                    auto_add_w = int(cap - desired_charge_w)
-                                    desired_charge_w = int(cap)
+                        if batt_not_full:
+                            allow_export_w = max(0, int(ALPHAESS_EXPORT_ALLOW_W_BELOW_FULL_SOC))
+                            export_w = int(alpha_snap.grid_export_w or 0)
+                            import_w = int(alpha_snap.grid_import_w or 0)
 
-                        base_w = int(max(0, pload_w + desired_charge_w))
-                        target_w_f = float(base_w)
+                            if export_w <= allow_export_w:
+                                target_w = int(GOODWE_RATED_W)
+                                target_reason = f"soc<{ALPHAESS_FULL_SOC_PCT:.1f}% export<={allow_export_w}W"
+                            else:
+                                prev_pct_for_target = last_limit_state[1] if last_limit_state is not None else 100
+                                prev_target_w = int(
+                                    round((float(prev_pct_for_target) / 100.0) * float(GOODWE_RATED_W))
+                                )
 
-                        if alpha_snap.pgrid_w is not None:
-                            # If importing, allow more PV; if exporting, back PV off.
-                            target_w_f += ALPHAESS_GRID_FEEDBACK_GAIN * float(alpha_snap.grid_import_w)
-                            target_w_f -= ALPHAESS_GRID_FEEDBACK_GAIN * float(alpha_snap.grid_export_w)
+                                over_w = int(export_w - allow_export_w)
+                                target_w_f = float(prev_target_w) - (ALPHAESS_GRID_FEEDBACK_GAIN * float(over_w))
 
-                            # Bias slightly toward import to avoid small accidental export.
-                            target_w_f -= float(ALPHAESS_GRID_IMPORT_BIAS_W)
+                                # If we're importing while in this mode, allow more PV.
+                                if import_w > 0:
+                                    target_w_f += ALPHAESS_GRID_FEEDBACK_GAIN * float(import_w)
 
-                        target_w = int(round(max(0.0, min(float(GOODWE_RATED_W), target_w_f))))
-                        target_reason = f"pload={pload_w}W charge={desired_charge_w}W" + (
-                            f"(auto+{auto_add_w}W)" if auto_add_w else ""
-                        )
+                                target_w = int(round(max(0.0, min(float(GOODWE_RATED_W), target_w_f))))
+                                target_reason = (
+                                    f"soc<{ALPHAESS_FULL_SOC_PCT:.1f}% export={export_w}W>allow{allow_export_w}W"
+                                )
+                        else:
+                            # Existing behaviour: cover house load + battery charge, then
+                            # trim any export using pGrid feedback (with a small import bias).
+                            pload_w = int(alpha_snap.pload_w or 0)
+                            measured_charge_w = int(alpha_snap.charge_w or 0)
+                            desired_charge_w = int(measured_charge_w)
+
+                            # If the battery is low and currently "idle", we still want to leave
+                            # enough PV headroom for it to begin charging (self-consumption mode).
+                            auto_add_w = 0
+                            if (
+                                alpha_snap.soc_pct is not None
+                                and ALPHAESS_AUTO_CHARGE_W > 0
+                                and ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT > 0
+                            ):
+                                try:
+                                    soc2 = float(alpha_snap.soc_pct)
+                                except Exception:
+                                    soc2 = None
+                                if soc2 is not None and soc2 < float(ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT):
+                                    cap = int(
+                                        max(0, min(int(ALPHAESS_AUTO_CHARGE_W), int(ALPHAESS_AUTO_CHARGE_MAX_W)))
+                                    )
+                                    if cap > desired_charge_w:
+                                        auto_add_w = int(cap - desired_charge_w)
+                                        desired_charge_w = int(cap)
+
+                            base_w = int(max(0, pload_w + desired_charge_w))
+                            target_w_f = float(base_w)
+
+                            if alpha_snap.pgrid_w is not None:
+                                # If importing, allow more PV; if exporting, back PV off.
+                                target_w_f += ALPHAESS_GRID_FEEDBACK_GAIN * float(alpha_snap.grid_import_w)
+                                target_w_f -= ALPHAESS_GRID_FEEDBACK_GAIN * float(alpha_snap.grid_export_w)
+
+                                # Bias slightly toward import to avoid small accidental export.
+                                target_w_f -= float(ALPHAESS_GRID_IMPORT_BIAS_W)
+
+                            target_w = int(round(max(0.0, min(float(GOODWE_RATED_W), target_w_f))))
+                            target_reason = f"pload={pload_w}W charge={desired_charge_w}W" + (
+                                f"(auto+{auto_add_w}W)" if auto_add_w else ""
+                            )
                 else:
                     target_w = int(GOODWE_RATED_W)
                     target_reason = "export_allowed"
