@@ -205,12 +205,17 @@ ALPHAESS_GRID_IMPORT_BIAS_W = _env_int("ALPHAESS_GRID_IMPORT_BIAS_W", 50)
 # Battery considered "full" at/above this SOC percentage.
 # Many systems only report SOC as an integer, so use 99.5 by default to treat 100% as full.
 ALPHAESS_FULL_SOC_PCT = _env_float("ALPHAESS_FULL_SOC_PCT", 99.5)
+# Treat battery as "near full" at/above this SOC.
+# Below this threshold we use a "soft" mode (allow 100% until export exceeds a small allowance).
+# At/above this threshold (or SOC unknown) we use a "strict" mode to keep export near zero.
+# Default equals FULL_SOC so behaviour is unchanged unless you set it.
+ALPHAESS_NEAR_FULL_SOC_PCT = _env_float("ALPHAESS_NEAR_FULL_SOC_PCT", ALPHAESS_FULL_SOC_PCT)
 
 # When export would cost money and the battery is NOT full, allow a small amount of export
 # before we start backing the GoodWe off (helps the battery begin charging / avoid oscillation).
 ALPHAESS_EXPORT_ALLOW_W_BELOW_FULL_SOC = _env_int("ALPHAESS_EXPORT_ALLOW_W_BELOW_FULL_SOC", 50)
 
-# When export would cost money (feed-in price > threshold), it can be useful to
+# When export would cost money (feed-in price < threshold), it can be useful to
 # deliberately leave headroom for the battery to *start* charging (self-consumption mode).
 # If SOC is below this threshold, we assume the battery can absorb up to AUTO_CHARGE_W.
 # Set AUTO_CHARGE_W=0 to disable this behaviour.
@@ -1354,7 +1359,7 @@ def main() -> int:
         f"[start] alphaess_idle_threshold={ALPHAESS_PBAT_IDLE_THRESHOLD_W}W "
         f"auto_charge_below_soc={ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT}% "
         f"auto_charge_w={ALPHAESS_AUTO_CHARGE_W}W auto_charge_max_w={ALPHAESS_AUTO_CHARGE_MAX_W}W "
-        f"full_soc={ALPHAESS_FULL_SOC_PCT}% "
+        f"full_soc={ALPHAESS_FULL_SOC_PCT}% near_full_soc={ALPHAESS_NEAR_FULL_SOC_PCT}% "
         f"export_allow_below_full_soc={ALPHAESS_EXPORT_ALLOW_W_BELOW_FULL_SOC}W"
     )
 
@@ -1447,11 +1452,24 @@ def main() -> int:
                     amber_interval_end = amber_snap.interval_end_utc
 
                 # If Amber is stale/unavailable, be conservative: assume export may be costing money.
+                export_costs_calc: Optional[str] = None
                 if amber_ok:
-                    export_costs = (feed_c is not None) and (float(feed_c) > float(EXPORT_COST_THRESHOLD_C))
+                    try:
+                        fc = float(feed_c) if feed_c is not None else float("nan")
+                        th = float(EXPORT_COST_THRESHOLD_C)
+                        if math.isnan(fc):
+                            export_costs = True
+                            export_costs_calc = "feedIn=nan -> costs=True"
+                        else:
+                            export_costs = fc < th
+                            export_costs_calc = f"feedIn={fc:.3f}c<{th:.3f}c => costs={export_costs}"
+                    except Exception as _e:
+                        export_costs = True
+                        export_costs_calc = f"feedIn err -> costs=True ({_e})" if DEBUG else "feedIn err -> costs=True"
                     amber_state = "ok"
                 else:
                     export_costs = True
+                    export_costs_calc = "amber_stale -> costs=True"
                     amber_state = "stale" if amber_snap is not None else "none"
 
                 # ---- GoodWe (fast) ----
@@ -1464,6 +1482,17 @@ def main() -> int:
                 meter_ok = runtime.meter_ok if runtime else None
                 wifi = runtime.wifi if runtime else None
                 temp_c = runtime.inverter_temp_c if runtime else None
+
+                # Some firmwares/maps return 0xFFFF_FFFF for unsupported values, which decodes to -1.
+                if gen_w == -1:
+                    gen_w = None
+                if feed_w == -1:
+                    feed_w = None
+                # Basic sanity bounds (avoid confusing logs)
+                if gen_w is not None and abs(int(gen_w)) > 30000:
+                    gen_w = None
+                if feed_w is not None and abs(int(feed_w)) > 30000:
+                    feed_w = None
 
                 # ---- AlphaESS (fast) ----
                 alpha_snap: Optional[AlphaEssSnapshot] = None
@@ -1484,10 +1513,12 @@ def main() -> int:
                     return f"{x}{suffix}"
 
                 amber_desc = f"amber={amber_state}"
+                if DEBUG and export_costs_calc:
+                    amber_desc += f"(calc={export_costs_calc})"
                 if amber_age_s is not None:
                     amber_desc += f"(age={amber_age_s}s)"
                 if amber_interval_end is not None:
-                    amber_desc += f"(end_utc={amber_interval_end.isoformat()})"
+                    amber_desc += f"(end={amber_interval_end.isoformat()})"
                 if amber_err and DEBUG:
                     amber_desc += f"(err={amber_err})"
                 if amber_import_w is not None or amber_feed_w is not None:
@@ -1513,7 +1544,7 @@ def main() -> int:
                         )
 
                 # Desired inverter power limit (W).
-                # If exporting to the grid would cost money (Amber feed-in price > threshold):
+                # If exporting to the grid would cost money (Amber feed-in price < threshold):
                 #   - If the Alpha battery is NOT full: allow the GoodWe to run at 100% until
                 #     grid export exceeds ALPHAESS_EXPORT_ALLOW_W_BELOW_FULL_SOC, then back off.
                 #   - If the battery is full (or SOC unknown): keep export near zero (bias to small import).
@@ -1523,16 +1554,18 @@ def main() -> int:
                         target_reason = "alpha_stale" if alpha_poller else "alpha_disabled"
                     else:
                         soc = alpha_snap.soc_pct
-                        batt_not_full = (soc is not None) and (float(soc) < float(ALPHAESS_FULL_SOC_PCT))
+                        # Use "soft" export control when SOC is comfortably below near-full.
+                        # Once the battery is near-full (or SOC unknown), switch to strict control.
+                        use_soft_mode = (soc is not None) and (float(soc) < float(ALPHAESS_NEAR_FULL_SOC_PCT))
 
-                        if batt_not_full:
+                        if use_soft_mode:
                             allow_export_w = max(0, int(ALPHAESS_EXPORT_ALLOW_W_BELOW_FULL_SOC))
                             export_w = int(alpha_snap.grid_export_w or 0)
                             import_w = int(alpha_snap.grid_import_w or 0)
 
                             if export_w <= allow_export_w:
                                 target_w = int(GOODWE_RATED_W)
-                                target_reason = f"soc<{ALPHAESS_FULL_SOC_PCT:.1f}% export<={allow_export_w}W"
+                                target_reason = f"soc<{ALPHAESS_NEAR_FULL_SOC_PCT:.1f}% export<={allow_export_w}W"
                             else:
                                 prev_pct_for_target = last_limit_state[1] if last_limit_state is not None else 100
                                 prev_target_w = int(
@@ -1548,7 +1581,7 @@ def main() -> int:
 
                                 target_w = int(round(max(0.0, min(float(GOODWE_RATED_W), target_w_f))))
                                 target_reason = (
-                                    f"soc<{ALPHAESS_FULL_SOC_PCT:.1f}% export={export_w}W>allow{allow_export_w}W"
+                                    f"soc<{ALPHAESS_NEAR_FULL_SOC_PCT:.1f}% export={export_w}W>allow{allow_export_w}W"
                                 )
                         else:
                             # Existing behaviour: cover house load + battery charge, then
@@ -1613,7 +1646,8 @@ def main() -> int:
                 target_pct = max(0, min(100, int(target_pct)))
                 target_w = int(round((target_pct / 100.0) * GOODWE_RATED_W))
 
-                want_enabled = 1 if export_costs else 0
+                want_enabled_raw = 1 if export_costs else 0
+                want_enabled = 1 if (want_enabled_raw or GOODWE_ALWAYS_ENABLED) else 0
                 want_pct = target_pct
 
                 now = time.time()

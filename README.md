@@ -5,7 +5,7 @@ This project controls a **GoodWe GW5000-DNS-30** (Modbus-TCP) using:
 - **Amber** prices (import + feed-in) to decide whether exporting is financially bad
 - **AlphaESS OpenAPI** telemetry (battery SOC / pGrid / load / charge) to keep export near zero *when export would cost money*
 
-It is designed to **avoid paying to export**, while allowing normal production when exporting earns you money (feedIn <= 0).
+It is designed to **avoid paying to export**, while allowing normal production when feed-in is positive.
 
 ---
 
@@ -67,14 +67,14 @@ Every loop, it:
 1. **Fetches Amber current prices**
 
 * `import` = cents/kWh you pay
-* `feedIn` = cents/kWh applied when exporting (**+ means you pay**, **- means you're paid**)
+* `feedIn` = cents/kWh you receive (can be negative)
 
 2. Computes:
 
-* `export_costs = (feedIn > EXPORT_COST_THRESHOLD_C)`
+* `export_costs = (feedIn < EXPORT_COST_THRESHOLD_C)`
 
   * Default threshold is `0.0c`
-  * Meaning: if feed-in becomes positive, exporting costs money.
+  * Meaning: if feed-in becomes negative, exporting costs money.
 
 3. **Fail-safe behaviour**
 
@@ -86,6 +86,9 @@ Every loop, it:
 ## Control modes when export would cost money
 
 ### A) If battery is NOT full (SOC < `ALPHAESS_FULL_SOC_PCT`)
+
+You can also define a **near‑full** threshold with `ALPHAESS_NEAR_FULL_SOC_PCT`.
+When SOC is at/above this value (or SOC is unknown), the controller uses the stricter mode (B) to keep export near zero.
 
 Goal: keep the GoodWe producing (and let the battery start charging), but avoid significant grid export.
 
@@ -187,12 +190,12 @@ Tune with:
 
 ## Tuning / troubleshooting
 
-### `It keeps limiting even when feedIn is negative`
+### `It keeps limiting even when feedIn is positive`
 
 * Confirm your pricing sign:
 
-  * feedIn > 0 means you pay to export
-  * feedIn < 0 means you get paid to export
+  * feedIn > 0 should mean you’re paid
+  * feedIn < 0 means you pay
 * `EXPORT_COST_THRESHOLD_C` should usually be `0.0`
 
 ### `pGrid looks wrong`
