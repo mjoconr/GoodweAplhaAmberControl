@@ -1745,7 +1745,7 @@ def main() -> int:
                 if amber_age_s is not None:
                     amber_desc += f"(age={amber_age_s}s)"
                 if amber_interval_end is not None:
-                    amber_desc += f"(end={amber_interval_end.isoformat()})"
+                    amber_desc += f"(end={amber_interval_end.isoformat()}Z)"
                 if amber_err and DEBUG:
                     amber_desc += f"(err={amber_err})"
                 if amber_import_w is not None or amber_feed_w is not None:
