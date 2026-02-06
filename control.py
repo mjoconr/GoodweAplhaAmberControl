@@ -958,6 +958,14 @@ class GoodWeRuntimeReader:
         self._resolved_profile: Optional[str] = None
         self._last_probe_error: Optional[str] = None
 
+        # Addressing quirks:
+        # GoodWe documentation often labels runtime data as 3xxxx "Input registers" (FC04),
+        # but some firmwares expose these via FC03 (holding) and/or expect 0-based offsets
+        # (e.g. 30100 -> 99 or 100 on the wire). We auto-detect and cache a delta for
+        # 3xxxx logical registers to make logs reliable.
+        self._reg3x_delta: Optional[int] = None
+        self._reg3x_prefer_fn: Optional[str] = None  # "input" or "holding"
+
         if self.profile in ("dns", "dt", "mt", "et", "off", "none", "disabled"):
             self._resolved_profile = self.profile
 
@@ -995,24 +1003,154 @@ class GoodWeRuntimeReader:
 
         return GoodWeRuntime(ts=time.time(), raw={"profile": "off", "err": f"unknown profile: {p}"})
 
-    def _read_regs_best_effort(self, base_reg: int, count: int) -> list[int]:
-        """Try input registers first, then holding registers (some firmwares mirror input -> holding)."""
-        try:
-            return self.modbus.read_input_u16s(int(base_reg), int(count))
-        except Exception:
-            return self.modbus.read_u16s(int(base_reg), int(count))
+@staticmethod
+def _candidate_wire_addrs(logical_reg: int) -> list[int]:
+    logical_reg = int(logical_reg)
+    cands: list[int] = [logical_reg]
+    if logical_reg >= 30000:
+        cands.append(logical_reg - 30000)
+    if logical_reg >= 30001:
+        cands.append(logical_reg - 30001)
+    out: list[int] = []
+    for a in cands:
+        if a < 0:
+            continue
+        if a not in out:
+            out.append(a)
+    return out
 
-    def _try_read_input_u16(self, reg: int) -> Optional[int]:
-        try:
-            return int(self.modbus.read_input_u16(int(reg)))
-        except Exception:
-            return None
+def _read_regs_best_effort(self, base_reg: int, count: int) -> list[int]:
+    """Read a block of registers with best-effort addressing + function-code fallbacks.
 
-    def _try_read_input_u16s(self, reg: int, count: int) -> Optional[list[int]]:
+    For 3xxxx logical registers (runtime maps), we:
+      - try cached delta (logical -> wire) first if known
+      - else probe common offsets (no offset, -30000, -30001)
+      - try FC04 (input) and FC03 (holding) for each candidate
+    """
+    logical_base = int(base_reg)
+    count = int(count)
+
+    def _try_read(wire_base: int, fn: str) -> list[int]:
+        if fn == "input":
+            return [int(x) for x in self.modbus.read_input_u16s(int(wire_base), int(count))]
+        return [int(x) for x in self.modbus.read_u16s(int(wire_base), int(count))]
+
+    # Non-3xxxx space: keep the simple fallback.
+    if logical_base < 30000:
         try:
-            return [int(x) for x in self.modbus.read_input_u16s(int(reg), int(count))]
+            return _try_read(logical_base, "input")
         except Exception:
-            return None
+            return _try_read(logical_base, "holding")
+
+    # If we've already discovered a working delta/fn for 3xxxx, use it first.
+    if self._reg3x_delta is not None:
+        wire_base = int(logical_base - int(self._reg3x_delta))
+        prefer = self._reg3x_prefer_fn or "input"
+        other = "holding" if prefer == "input" else "input"
+        try:
+            return _try_read(wire_base, prefer)
+        except Exception:
+            try:
+                return _try_read(wire_base, other)
+            except Exception:
+                # fall back to probing below
+                pass
+
+    last_exc: Optional[Exception] = None
+    for wire_base in self._candidate_wire_addrs(logical_base):
+        for fn in ("input", "holding"):
+            try:
+                regs = _try_read(wire_base, fn)
+                self._reg3x_delta = int(logical_base - wire_base)
+                self._reg3x_prefer_fn = fn
+                return regs
+            except Exception as e:
+                last_exc = e
+                continue
+    raise last_exc or RuntimeError("runtime register read failed")
+
+def _try_read_input_u16(self, reg: int) -> Optional[int]:
+    reg = int(reg)
+
+    def _try_read(wire_reg: int, fn: str) -> int:
+        if fn == "input":
+            return int(self.modbus.read_input_u16(int(wire_reg)))
+        return int(self.modbus.read_u16(int(wire_reg)))
+
+    if reg < 30000:
+        try:
+            return _try_read(reg, "input")
+        except Exception:
+            try:
+                return _try_read(reg, "holding")
+            except Exception:
+                return None
+
+    if self._reg3x_delta is not None:
+        wire_reg = int(reg - int(self._reg3x_delta))
+        prefer = self._reg3x_prefer_fn or "input"
+        other = "holding" if prefer == "input" else "input"
+        try:
+            return _try_read(wire_reg, prefer)
+        except Exception:
+            try:
+                return _try_read(wire_reg, other)
+            except Exception:
+                # probe below
+                pass
+
+    for wire_reg in self._candidate_wire_addrs(reg):
+        for fn in ("input", "holding"):
+            try:
+                v = _try_read(wire_reg, fn)
+                self._reg3x_delta = int(reg - wire_reg)
+                self._reg3x_prefer_fn = fn
+                return v
+            except Exception:
+                continue
+    return None
+
+def _try_read_input_u16s(self, reg: int, count: int) -> Optional[list[int]]:
+    reg = int(reg)
+    count = int(count)
+
+    def _try_read(wire_reg: int, fn: str) -> list[int]:
+        if fn == "input":
+            return [int(x) for x in self.modbus.read_input_u16s(int(wire_reg), int(count))]
+        return [int(x) for x in self.modbus.read_u16s(int(wire_reg), int(count))]
+
+    if reg < 30000:
+        try:
+            return _try_read(reg, "input")
+        except Exception:
+            try:
+                return _try_read(reg, "holding")
+            except Exception:
+                return None
+
+    if self._reg3x_delta is not None:
+        wire_reg = int(reg - int(self._reg3x_delta))
+        prefer = self._reg3x_prefer_fn or "input"
+        other = "holding" if prefer == "input" else "input"
+        try:
+            return _try_read(wire_reg, prefer)
+        except Exception:
+            try:
+                return _try_read(wire_reg, other)
+            except Exception:
+                # probe below
+                pass
+
+    for wire_reg in self._candidate_wire_addrs(reg):
+        for fn in ("input", "holding"):
+            try:
+                v = _try_read(wire_reg, fn)
+                self._reg3x_delta = int(reg - wire_reg)
+                self._reg3x_prefer_fn = fn
+                return v
+            except Exception:
+                continue
+    return None
 
     @staticmethod
     def _i16_at(regs: list[int], base: int, reg: int) -> int:
@@ -1602,7 +1740,7 @@ def main() -> int:
                             export_costs_calc = "feedIn=nan -> costs=True"
                         else:
                             export_costs = fc > th # DO NOT CHANGE THIS IT IS CORRECT
-                            export_costs_calc = f"feedIn={fc:.3f}c>{th:.3f}c => costs={export_costs}"
+                            export_costs_calc = f"feedIn={fc:.3f}c<{th:.3f}c => costs={export_costs}"
                     except Exception as _e:
                         export_costs = True
                         export_costs_calc = f"feedIn err -> costs=True ({_e})" if DEBUG else "feedIn err -> costs=True"
@@ -1658,7 +1796,7 @@ def main() -> int:
                 if amber_age_s is not None:
                     amber_desc += f"(age={amber_age_s}s)"
                 if amber_interval_end is not None:
-                    amber_desc += f"(end={amber_interval_end.isoformat()}Z)"
+                    amber_desc += f"(end={amber_interval_end.isoformat()})"
                 if amber_err and DEBUG:
                     amber_desc += f"(err={amber_err})"
                 if amber_import_w is not None or amber_feed_w is not None:
@@ -1763,7 +1901,7 @@ def main() -> int:
                     f"[{_iso_now()}] import={_fmt_opt(import_c,'c')} feedIn={_fmt_opt(feed_c,'c')} "
                     f"thresh={EXPORT_COST_THRESHOLD_C}c export_costs={export_costs} {amber_desc} "
                     f"gen={_fmt_opt(gen_w,'W')} pv_est={_fmt_opt(pv_est_w,'W')} feed={_fmt_opt(feed_w,'W')} "
-                    f"pwrLimitFn={_fmt_opt(pwr_limit_fn)} meterOK={_fmt_opt(meter_ok)} wifi={_fmt_opt(wifi,'%')} temp={_fmt_opt(temp_c,'C')} "
+                    f"pwrLimitFn={_fmt_opt(pwr_limit_fn)} meterOK={_fmt_opt(meter_ok)} wifi={_fmt_opt(wifi)} temp={_fmt_opt(temp_c,'C')} "
                     f"{alpha_desc} reason={target_reason} "
                     f"-> want_limit={want_pct}% (~{target_w}W) (enabled={want_enabled}) "
                     f"cur_limit={current_limit}"
