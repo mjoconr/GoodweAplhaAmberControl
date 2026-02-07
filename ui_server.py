@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Dict, Iterable
 
 from fastapi import FastAPI, Request
@@ -36,6 +37,9 @@ API_UPSTREAM = _env("UI_API_UPSTREAM", _env("UI_API_BASE", "http://127.0.0.1:800
 # If enabled, the UI server reverse-proxies /api/* to API_UPSTREAM.
 # This avoids the common pitfall where the browser tries to connect to 127.0.0.1 (its own machine).
 UI_PROXY_API = _env_bool("UI_PROXY_API", "1")
+
+# Build id to defeat caching (changes each UI server start unless overridden)
+BUILD_ID = _env("UI_BUILD_ID", str(int(time.time())))
 
 app = FastAPI(title="GoodWe Control UI")
 
@@ -124,6 +128,7 @@ async def proxy_api(path: str, request: Request) -> Response:
         if not want_stream:
             resp = await client.send(req, stream=False)
             resp_headers = _filter_headers(resp.headers.items())
+            resp_headers.setdefault("cache-control", "no-store")
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
@@ -159,7 +164,7 @@ async def proxy_api(path: str, request: Request) -> Response:
 
 
 # -------------------------
-# UI page
+# UI page (no inline JS; served as /app.js)
 # -------------------------
 
 _HTML_TEMPLATE = """<!doctype html>
@@ -167,6 +172,8 @@ _HTML_TEMPLATE = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <meta http-equiv="Pragma" content="no-cache" />
   <title>GoodWe Control - Live</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #0b0f14; color: #e6edf3; }
@@ -190,15 +197,21 @@ _HTML_TEMPLATE = """<!doctype html>
     .muted { opacity: 0.7; }
     .err { border-color: rgba(248, 81, 73, 0.55); background: rgba(248, 81, 73, 0.08); }
     .err pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
+    .build { margin-left: auto; opacity: 0.5; font-size: 11px; }
   </style>
 </head>
-<body>
+<body data-api-base="__API_BASE__" data-mode="__MODE__" data-build="__BUILD__">
   <header>
     <h1>GoodWe Control - Live</h1>
     <div class="status" id="status">connecting...</div>
+    <div class="build">build: __BUILD__</div>
   </header>
 
   <main>
+    <noscript>
+      <div class="card err"><h2>UI error</h2><pre>JavaScript is disabled in this browser.</pre></div>
+    </noscript>
+
     <div class="card err" id="errorBox" style="display:none;">
       <h2>UI error</h2>
       <pre id="errorText"></pre>
@@ -272,207 +285,235 @@ _HTML_TEMPLATE = """<!doctype html>
     </div>
   </main>
 
-<script>
-// Extremely conservative JS for maximum compatibility. No async/await, no template literals.
-
-var API_BASE = __API_BASE__;
-var MODE = __MODE__;
-
-function $(id) { return document.getElementById(id); }
-
-function showError(msg) {
-  var box = $('errorBox');
-  var pre = $('errorText');
-  box.style.display = 'block';
-  pre.textContent = msg;
-}
-
-// Prove the script actually executed.
-try {
-  $('status').textContent = 'script running (' + MODE + ')';
-} catch (e) { }
-
-window.addEventListener('error', function(e) {
-  showError('error: ' + e.message + '\n' + e.filename + ':' + e.lineno + ':' + e.colno);
-});
-
-function pill(ok, text) {
-  var cls = (ok === true) ? 'pill ok' : ((ok === false) ? 'pill bad' : 'pill warn');
-  return '<span class="' + cls + '">' + text + '</span>';
-}
-
-function fmt(x, suffix) {
-  if (suffix === undefined) suffix = '';
-  if (x === null || x === undefined) return '—';
-  return String(x) + suffix;
-}
-
-function appendLog(line) {
-  var el = $('log');
-  el.textContent += line;
-  el.textContent += String.fromCharCode(10);
-  el.scrollTop = el.scrollHeight;
-}
-
-function addRow(e) {
-  var d = e.data || {};
-  var amber = (d.sources && d.sources.amber) ? d.sources.amber : {};
-  var dec = d.decision || {};
-
-  var tr = document.createElement('tr');
-  tr.innerHTML =
-    '<td>' + e.id + '</td>' +
-    '<td>' + fmt(e.ts_local) + '</td>' +
-    '<td>' + fmt(amber.feedin_c, 'c') + '</td>' +
-    '<td>' + String(dec.export_costs) + '</td>' +
-    '<td>' + fmt(dec.want_pct, '%') + '</td>' +
-    '<td>' + String((dec.reason || '')).slice(0, 80) + '</td>';
-
-  var rows = $('rows');
-  if (rows.firstChild) rows.insertBefore(tr, rows.firstChild);
-  else rows.appendChild(tr);
-
-  while (rows.children.length > 50) rows.removeChild(rows.lastChild);
-}
-
-function render(e) {
-  var d = e.data || {};
-
-  var amber = (d.sources && d.sources.amber) ? d.sources.amber : {};
-  var alpha = (d.sources && d.sources.alpha) ? d.sources.alpha : {};
-  var gw = (d.sources && d.sources.goodwe) ? d.sources.goodwe : {};
-
-  var dec = d.decision || {
-    export_costs: Boolean(e.export_costs),
-    want_pct: e.want_pct,
-    want_enabled: e.want_enabled,
-    reason: e.reason,
-    target_w: undefined
-  };
-
-  var act = d.actuation || {};
-
-  $('export_costs').innerHTML = dec.export_costs ? pill(false, 'true (costs)') : pill(true, 'false (ok)');
-  $('want_limit').textContent = fmt(dec.want_pct, '%') + (dec.target_w ? (' (~' + fmt(dec.target_w, 'W') + ')') : '');
-  $('want_enabled').textContent = fmt(dec.want_enabled);
-  $('reason').textContent = fmt(dec.reason);
-  $('write').textContent = act.write_attempted ? (act.write_ok ? 'ok' : ('failed: ' + fmt(act.write_error))) : 'not attempted';
-
-  $('amber_feedin').textContent = fmt(amber.feedin_c, 'c');
-  $('amber_import').textContent = fmt(amber.import_c, 'c');
-  $('amber_age').textContent = fmt(amber.age_s, 's');
-  $('amber_end').textContent = fmt(amber.interval_end_utc);
-
-  $('alpha_soc').textContent = fmt(alpha.soc_pct, '%');
-  $('alpha_pload').textContent = fmt(alpha.pload_w, 'W');
-  $('alpha_pbat').textContent = fmt(alpha.pbat_w, 'W');
-  $('alpha_pgrid').textContent = fmt(alpha.pgrid_w, 'W');
-  $('alpha_age').textContent = fmt(alpha.age_s, 's');
-
-  $('gw_gen').textContent = fmt(gw.gen_w, 'W');
-  $('gw_feed').textContent = fmt(gw.feed_w, 'W');
-  $('gw_temp').textContent = fmt(gw.temp_c, 'C');
-  $('gw_meter').textContent = fmt(gw.meter_ok);
-  $('gw_wifi').textContent = fmt(gw.wifi_pct, '%');
-
-  appendLog('[' + e.ts_local + '] feedIn=' + fmt(amber.feedin_c,'c') +
-            ' export_costs=' + String(dec.export_costs) +
-            ' want=' + fmt(dec.want_pct,'%') +
-            ' enabled=' + fmt(dec.want_enabled) +
-            ' reason=' + String(dec.reason || ''));
-
-  addRow(e);
-}
-
-function httpGetJson(url, onOk, onErr) {
-  try {
-    var xhr = new XMLHttpRequest();
-    xhr.open('GET', url, true);
-    xhr.setRequestHeader('Cache-Control', 'no-store');
-    xhr.onreadystatechange = function() {
-      if (xhr.readyState !== 4) return;
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          onOk(JSON.parse(xhr.responseText));
-        } catch (e) {
-          onErr('JSON parse failed: ' + e);
-        }
-      } else {
-        onErr('HTTP ' + xhr.status + ' ' + xhr.statusText + ' body=' + xhr.responseText);
-      }
-    };
-    xhr.send(null);
-  } catch (e) {
-    onErr('XHR failed: ' + e);
-  }
-}
-
-function init() {
-  var baseLabel = (API_BASE && API_BASE.length) ? API_BASE : window.location.origin;
-  $('status').textContent = 'API ' + MODE + ': ' + baseLabel;
-
-  httpGetJson((API_BASE || '') + '/api/events/latest',
-    function(e) {
-      try {
-        window.__lastId = e.id || 0;
-        render(e);
-      } catch (err) {
-        showError('render(latest) failed: ' + (err && err.stack ? err.stack : err));
-        return;
-      }
-
-      try {
-        var esUrl = (API_BASE || '') + '/api/sse/events?after_id=' + window.__lastId;
-        appendLog('connecting SSE: ' + esUrl);
-        var es = new EventSource(esUrl);
-
-        es.addEventListener('event', function(msg) {
-          try {
-            var ev = JSON.parse(msg.data);
-            window.__lastId = Math.max(window.__lastId, ev.id || 0);
-            render(ev);
-            $('status').textContent = 'connected ' + MODE + ' (last id: ' + window.__lastId + ')';
-          } catch (err) {
-            showError('SSE parse/render error: ' + (err && err.stack ? err.stack : err) + '\nraw: ' + msg.data);
-          }
-        });
-
-        es.onerror = function() {
-          $('status').textContent = 'disconnected ' + MODE + ' - retrying...';
-        };
-      } catch (e) {
-        showError('EventSource failed: ' + e);
-      }
-    },
-    function(errmsg) {
-      showError('GET /api/events/latest failed: ' + errmsg);
-      $('status').textContent = 'API unreachable ' + MODE + ': ' + baseLabel;
-    }
-  );
-}
-
-try {
-  init();
-} catch (e) {
-  showError('init threw: ' + (e && e.stack ? e.stack : e));
-}
-</script>
+  <script src="/app.js?v=__BUILD__"></script>
 </body>
 </html>
 """
 
 
+_JS_TEMPLATE = """// app.js (very conservative JS)
+(function() {
+  function $(id) { return document.getElementById(id); }
+
+  function showError(msg) {
+    var box = $('errorBox');
+    var pre = $('errorText');
+    if (box && pre) {
+      box.style.display = 'block';
+      pre.textContent = msg;
+    }
+  }
+
+  function pill(ok, text) {
+    var cls = (ok === true) ? 'pill ok' : ((ok === false) ? 'pill bad' : 'pill warn');
+    return '<span class="' + cls + '">' + text + '</span>';
+  }
+
+  function fmt(x, suffix) {
+    if (suffix === undefined) suffix = '';
+    if (x === null || x === undefined) return '—';
+    return String(x) + suffix;
+  }
+
+  function appendLog(line) {
+    var el = $('log');
+    if (!el) return;
+    el.textContent += line;
+    el.textContent += String.fromCharCode(10);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  window.addEventListener('error', function(e) {
+    showError('error: ' + e.message + '\n' + e.filename + ':' + e.lineno + ':' + e.colno);
+  });
+
+  var body = document.body;
+  var API_BASE = (body && body.getAttribute('data-api-base')) ? body.getAttribute('data-api-base') : '';
+  var MODE = (body && body.getAttribute('data-mode')) ? body.getAttribute('data-mode') : '';
+  var BUILD = (body && body.getAttribute('data-build')) ? body.getAttribute('data-build') : '';
+
+  try {
+    var st = $('status');
+    if (st) st.textContent = 'script running (' + MODE + ', build ' + BUILD + ')';
+  } catch (e) {}
+
+  function addRow(e) {
+    var d = e.data || {};
+    var amber = (d.sources && d.sources.amber) ? d.sources.amber : {};
+    var dec = d.decision || {};
+
+    var tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td>' + e.id + '</td>' +
+      '<td>' + fmt(e.ts_local) + '</td>' +
+      '<td>' + fmt(amber.feedin_c, 'c') + '</td>' +
+      '<td>' + String(dec.export_costs) + '</td>' +
+      '<td>' + fmt(dec.want_pct, '%') + '</td>' +
+      '<td>' + String((dec.reason || '')).slice(0, 80) + '</td>';
+
+    var rows = $('rows');
+    if (!rows) return;
+    if (rows.firstChild) rows.insertBefore(tr, rows.firstChild);
+    else rows.appendChild(tr);
+
+    while (rows.children.length > 50) rows.removeChild(rows.lastChild);
+  }
+
+  function render(e) {
+    var d = e.data || {};
+    var amber = (d.sources && d.sources.amber) ? d.sources.amber : {};
+    var alpha = (d.sources && d.sources.alpha) ? d.sources.alpha : {};
+    var gw = (d.sources && d.sources.goodwe) ? d.sources.goodwe : {};
+
+    var dec = d.decision || {
+      export_costs: Boolean(e.export_costs),
+      want_pct: e.want_pct,
+      want_enabled: e.want_enabled,
+      reason: e.reason,
+      target_w: undefined
+    };
+
+    var act = d.actuation || {};
+
+    var el;
+
+    el = $('export_costs'); if (el) el.innerHTML = dec.export_costs ? pill(false, 'true (costs)') : pill(true, 'false (ok)');
+    el = $('want_limit'); if (el) el.textContent = fmt(dec.want_pct, '%') + (dec.target_w ? (' (~' + fmt(dec.target_w, 'W') + ')') : '');
+    el = $('want_enabled'); if (el) el.textContent = fmt(dec.want_enabled);
+    el = $('reason'); if (el) el.textContent = fmt(dec.reason);
+    el = $('write'); if (el) el.textContent = act.write_attempted ? (act.write_ok ? 'ok' : ('failed: ' + fmt(act.write_error))) : 'not attempted';
+
+    el = $('amber_feedin'); if (el) el.textContent = fmt(amber.feedin_c, 'c');
+    el = $('amber_import'); if (el) el.textContent = fmt(amber.import_c, 'c');
+    el = $('amber_age'); if (el) el.textContent = fmt(amber.age_s, 's');
+    el = $('amber_end'); if (el) el.textContent = fmt(amber.interval_end_utc);
+
+    el = $('alpha_soc'); if (el) el.textContent = fmt(alpha.soc_pct, '%');
+    el = $('alpha_pload'); if (el) el.textContent = fmt(alpha.pload_w, 'W');
+    el = $('alpha_pbat'); if (el) el.textContent = fmt(alpha.pbat_w, 'W');
+    el = $('alpha_pgrid'); if (el) el.textContent = fmt(alpha.pgrid_w, 'W');
+    el = $('alpha_age'); if (el) el.textContent = fmt(alpha.age_s, 's');
+
+    el = $('gw_gen'); if (el) el.textContent = fmt(gw.gen_w, 'W');
+    el = $('gw_feed'); if (el) el.textContent = fmt(gw.feed_w, 'W');
+    el = $('gw_temp'); if (el) el.textContent = fmt(gw.temp_c, 'C');
+    el = $('gw_meter'); if (el) el.textContent = fmt(gw.meter_ok);
+    el = $('gw_wifi'); if (el) el.textContent = fmt(gw.wifi_pct, '%');
+
+    appendLog('[' + e.ts_local + '] feedIn=' + fmt(amber.feedin_c,'c') +
+              ' export_costs=' + String(dec.export_costs) +
+              ' want=' + fmt(dec.want_pct,'%') +
+              ' enabled=' + fmt(dec.want_enabled) +
+              ' reason=' + String(dec.reason || ''));
+
+    addRow(e);
+  }
+
+  function httpGetJson(url, onOk, onErr) {
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      xhr.setRequestHeader('Cache-Control', 'no-store');
+      xhr.onreadystatechange = function() {
+        if (xhr.readyState !== 4) return;
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            onOk(JSON.parse(xhr.responseText));
+          } catch (e) {
+            onErr('JSON parse failed: ' + e);
+          }
+        } else {
+          onErr('HTTP ' + xhr.status + ' ' + xhr.statusText + ' body=' + xhr.responseText);
+        }
+      };
+      xhr.send(null);
+    } catch (e) {
+      onErr('XHR failed: ' + e);
+    }
+  }
+
+  function init() {
+    var baseLabel = (API_BASE && API_BASE.length) ? API_BASE : window.location.origin;
+    var st = $('status');
+    if (st) st.textContent = 'API ' + MODE + ': ' + baseLabel + ' (build ' + BUILD + ')';
+
+    httpGetJson((API_BASE || '') + '/api/events/latest',
+      function(e) {
+        try {
+          window.__lastId = e.id || 0;
+          render(e);
+        } catch (err) {
+          showError('render(latest) failed: ' + (err && err.stack ? err.stack : err));
+          return;
+        }
+
+        try {
+          var esUrl = (API_BASE || '') + '/api/sse/events?after_id=' + window.__lastId;
+          appendLog('connecting SSE: ' + esUrl);
+          var es = new EventSource(esUrl);
+
+          es.addEventListener('event', function(msg) {
+            try {
+              var ev = JSON.parse(msg.data);
+              window.__lastId = Math.max(window.__lastId, ev.id || 0);
+              render(ev);
+              var st2 = $('status');
+              if (st2) st2.textContent = 'connected ' + MODE + ' (last id: ' + window.__lastId + ', build ' + BUILD + ')';
+            } catch (err) {
+              showError('SSE parse/render error: ' + (err && err.stack ? err.stack : err) + '\nraw: ' + msg.data);
+            }
+          });
+
+          es.onerror = function() {
+            var st3 = $('status');
+            if (st3) st3.textContent = 'disconnected ' + MODE + ' - retrying... (build ' + BUILD + ')';
+          };
+        } catch (e) {
+          showError('EventSource failed: ' + e);
+        }
+      },
+      function(errmsg) {
+        showError('GET /api/events/latest failed: ' + errmsg);
+        var st4 = $('status');
+        if (st4) st4.textContent = 'API unreachable ' + MODE + ': ' + baseLabel + ' (build ' + BUILD + ')';
+      }
+    );
+  }
+
+  try {
+    init();
+  } catch (e) {
+    showError('init threw: ' + (e && e.stack ? e.stack : e));
+  }
+})();
+"""
+
+
 @app.get("/", response_class=HTMLResponse)
-def index() -> str:
+def index() -> HTMLResponse:
     # If we are proxying, the browser should use relative paths (same origin).
     # Otherwise, it should connect directly to UI_API_BASE.
     api_base_for_browser = "" if UI_PROXY_API else _env("UI_API_BASE", "")
     proxy_banner = "proxied" if UI_PROXY_API else "direct"
 
     html = _HTML_TEMPLATE
-    html = html.replace("__API_BASE__", json.dumps(api_base_for_browser))
-    html = html.replace("__MODE__", json.dumps(proxy_banner))
-    return html
+    html = html.replace("__API_BASE__", api_base_for_browser)
+    html = html.replace("__MODE__", proxy_banner)
+    html = html.replace("__BUILD__", BUILD_ID)
+
+    # Defeat caching of the HTML itself.
+    headers = {"cache-control": "no-store"}
+    return HTMLResponse(content=html, headers=headers)
+
+
+@app.get("/app.js")
+def app_js() -> Response:
+    # Defeat caching of JS.
+    return Response(
+        content=_JS_TEMPLATE,
+        media_type="application/javascript",
+        headers={"cache-control": "no-store"},
+    )
 
 
 if __name__ == "__main__":
