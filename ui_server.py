@@ -454,7 +454,64 @@ _JS_TEMPLATE = """(function() {
     return String(x) + suffix;
   }
 
-  function appendLog(line) {
+    var seenIds = {};
+
+  function seedSeenIds() {
+    var rows = $('rows');
+    if (!rows || !rows.children) return;
+    for (var i = 0; i < rows.children.length; i++) {
+      var tr = rows.children[i];
+      try {
+        var tds = tr.getElementsByTagName('td');
+        if (!tds || tds.length < 1) continue;
+        var id = parseInt((tds[0].textContent || '').trim(), 10);
+        if (!isNaN(id)) seenIds[id] = true;
+      } catch (e) {}
+    }
+  }
+
+  function addRow(e) {
+    if (!e || e.id === null || e.id === undefined) return;
+    var id = parseInt(e.id, 10);
+    if (isNaN(id)) return;
+    if (seenIds[id]) return;
+    seenIds[id] = true;
+
+    var d = e.data || {};
+    var sources = d.sources || {};
+    var amber = sources.amber || {};
+    var dec = d.decision || {};
+
+    var tr = document.createElement('tr');
+    tr.setAttribute('data-id', String(id));
+    tr.innerHTML =
+      '<td>' + fmt(id) + '</td>' +
+      '<td>' + fmt(e.ts_local) + '</td>' +
+      '<td>' + fmt(amber.feedin_c, 'c') + '</td>' +
+      '<td>' + String(dec.export_costs) + '</td>' +
+      '<td>' + fmt(dec.want_pct, '%') + '</td>' +
+      '<td>' + String((dec.reason || '')).slice(0, 80) + '</td>';
+
+    var rows = $('rows');
+    if (!rows) return;
+    if (rows.firstChild) rows.insertBefore(tr, rows.firstChild);
+    else rows.appendChild(tr);
+
+    while (rows.children.length > 50) {
+      var last = rows.lastChild;
+      if (!last) break;
+      try {
+        var tds = last.getElementsByTagName('td');
+        if (tds && tds.length) {
+          var lastId = parseInt((tds[0].textContent || '').trim(), 10);
+          if (!isNaN(lastId)) delete seenIds[lastId];
+        }
+      } catch (e) {}
+      rows.removeChild(last);
+    }
+  }
+
+function appendLog(line) {
     var el = $('log');
     if (!el) return;
     el.textContent += line + String.fromCharCode(10);
@@ -544,6 +601,7 @@ _JS_TEMPLATE = """(function() {
         var ev = JSON.parse(msg.data);
         if (ev && ev.id) lastId = Math.max(lastId, ev.id);
         renderEvent(ev);
+        addRow(ev);
         setStatus('connected (last id: ' + String(lastId) + ')');
       } catch (e) { showError('SSE parse/render error: ' + e + '\\nraw: ' + msg.data); }
     });
@@ -559,10 +617,12 @@ _JS_TEMPLATE = """(function() {
     var build = document.body ? document.body.getAttribute('data-build') : '';
     var mode = document.body ? document.body.getAttribute('data-mode') : '';
     setStatus('js running (mode ' + mode + ', build ' + build + ')');
+    seedSeenIds();
 
     httpGetJson('/api/events/latest', function(e) {
       lastId = e.id || 0;
       renderEvent(e);
+      addRow(e);
       setStatus('api ok (latest id: ' + String(lastId) + ') - connecting SSE...');
       connectSSE();
     }, function(err) {
@@ -636,7 +696,7 @@ def index(request: Request) -> HTMLResponse:
         status += " - SSE mode"
 
     refresh_label = "off (SSE live)" if refresh_sec == 0 else f"{refresh_sec}s (server refresh)"
-    script_tag = "" if nojs else '<script src="/app.js?v=__BUILD__"></script>'
+    script_tag = "" if nojs else f'<script src="/app.js?v={BUILD_ID}"></script>'
 
     html_doc = _HTML_TEMPLATE
     html_doc = html_doc.replace("__META_REFRESH__", meta_refresh)
