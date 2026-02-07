@@ -158,44 +158,38 @@ async def proxy_api(path: str, request: Request) -> Response:
         return Response(status_code=502, content=f"Upstream API error: {e}".encode("utf-8"))
 
 
-@app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    # If we are proxying, the browser should use relative paths (same origin).
-    # Otherwise, it should connect directly to UI_API_BASE.
-    api_base_for_browser = "" if UI_PROXY_API else _env("UI_API_BASE", "")
-    api_base_js = json.dumps(api_base_for_browser)
+# -------------------------
+# UI page
+# -------------------------
 
-    proxy_banner = "proxied" if UI_PROXY_API else "direct"
-    proxy_banner_js = json.dumps(proxy_banner)
-
-    return f"""<!doctype html>
+_HTML_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>GoodWe Control - Live</title>
   <style>
-    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #0b0f14; color: #e6edf3; }}
-    header {{ padding: 12px 16px; border-bottom: 1px solid #202938; display: flex; gap: 12px; align-items: baseline; }}
-    header h1 {{ font-size: 16px; margin: 0; font-weight: 600; }}
-    header .status {{ font-size: 12px; opacity: 0.8; }}
-    main {{ padding: 16px; display: grid; gap: 12px; grid-template-columns: 1fr; }}
-    .grid {{ display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }}
-    .card {{ background: #0f1723; border: 1px solid #202938; border-radius: 10px; padding: 12px; }}
-    .card h2 {{ font-size: 13px; margin: 0 0 8px; opacity: 0.9; }}
-    .kv {{ display: grid; grid-template-columns: 140px 1fr; gap: 4px 10px; font-size: 13px; }}
-    .kv div:nth-child(odd) {{ opacity: 0.75; }}
-    .pill {{ display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #2a3547; }}
-    .pill.ok {{ background: rgba(46, 160, 67, 0.15); border-color: rgba(46, 160, 67, 0.45); }}
-    .pill.bad {{ background: rgba(248, 81, 73, 0.15); border-color: rgba(248, 81, 73, 0.45); }}
-    .pill.warn {{ background: rgba(210, 153, 34, 0.15); border-color: rgba(210, 153, 34, 0.45); }}
-    .log {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; white-space: pre; overflow: auto; max-height: 45vh; }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
-    th, td {{ border-bottom: 1px solid #202938; padding: 6px 8px; text-align: left; }}
-    th {{ opacity: 0.8; font-weight: 600; }}
-    .muted {{ opacity: 0.7; }}
-    .err {{ border-color: rgba(248, 81, 73, 0.55); background: rgba(248, 81, 73, 0.08); }}
-    .err pre {{ margin: 0; white-space: pre-wrap; word-break: break-word; }}
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #0b0f14; color: #e6edf3; }
+    header { padding: 12px 16px; border-bottom: 1px solid #202938; display: flex; gap: 12px; align-items: baseline; }
+    header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+    header .status { font-size: 12px; opacity: 0.8; }
+    main { padding: 16px; display: grid; gap: 12px; grid-template-columns: 1fr; }
+    .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+    .card { background: #0f1723; border: 1px solid #202938; border-radius: 10px; padding: 12px; }
+    .card h2 { font-size: 13px; margin: 0 0 8px; opacity: 0.9; }
+    .kv { display: grid; grid-template-columns: 140px 1fr; gap: 4px 10px; font-size: 13px; }
+    .kv div:nth-child(odd) { opacity: 0.75; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #2a3547; }
+    .pill.ok { background: rgba(46, 160, 67, 0.15); border-color: rgba(46, 160, 67, 0.45); }
+    .pill.bad { background: rgba(248, 81, 73, 0.15); border-color: rgba(248, 81, 73, 0.45); }
+    .pill.warn { background: rgba(210, 153, 34, 0.15); border-color: rgba(210, 153, 34, 0.45); }
+    .log { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; white-space: pre; overflow: auto; max-height: 45vh; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { border-bottom: 1px solid #202938; padding: 6px 8px; text-align: left; }
+    th { opacity: 0.8; font-weight: 600; }
+    .muted { opacity: 0.7; }
+    .err { border-color: rgba(248, 81, 73, 0.55); background: rgba(248, 81, 73, 0.08); }
+    .err pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
   </style>
 </head>
 <body>
@@ -279,198 +273,206 @@ def index() -> str:
   </main>
 
 <script>
-  // NOTE: We intentionally keep this JS fairly "old" for maximum compatibility
-  // (no optional chaining, no async/await, no template literals required).
+// Extremely conservative JS for maximum compatibility. No async/await, no template literals.
 
-  var API_BASE = {api_base_js};
-  var MODE = {proxy_banner_js};
+var API_BASE = __API_BASE__;
+var MODE = __MODE__;
 
-  function $(id) {{ return document.getElementById(id); }}
+function $(id) { return document.getElementById(id); }
 
-  function showError(msg) {{
-    var box = $('errorBox');
-    var pre = $('errorText');
-    box.style.display = 'block';
-    pre.textContent = msg;
-  }}
+function showError(msg) {
+  var box = $('errorBox');
+  var pre = $('errorText');
+  box.style.display = 'block';
+  pre.textContent = msg;
+}
 
-  // mark that the script loaded at all
-  try {{
-    $('status').textContent = 'script loaded (' + MODE + ')';
-  }} catch (e) {{
-    // ignore
-  }}
+// Prove the script actually executed.
+try {
+  $('status').textContent = 'script running (' + MODE + ')';
+} catch (e) { }
 
-  window.addEventListener('error', function(e) {{
-    showError('error: ' + e.message + '\n' + e.filename + ':' + e.lineno + ':' + e.colno);
-  }});
+window.addEventListener('error', function(e) {
+  showError('error: ' + e.message + '\n' + e.filename + ':' + e.lineno + ':' + e.colno);
+});
 
-  window.addEventListener('unhandledrejection', function(e) {{
-    showError('unhandledrejection: ' + String(e.reason));
-  }});
+function pill(ok, text) {
+  var cls = (ok === true) ? 'pill ok' : ((ok === false) ? 'pill bad' : 'pill warn');
+  return '<span class="' + cls + '">' + text + '</span>';
+}
 
-  function pill(ok, text) {{
-    var cls = (ok === true) ? 'pill ok' : ((ok === false) ? 'pill bad' : 'pill warn');
-    return '<span class="' + cls + '">' + text + '</span>';
-  }}
+function fmt(x, suffix) {
+  if (suffix === undefined) suffix = '';
+  if (x === null || x === undefined) return '—';
+  return String(x) + suffix;
+}
 
-  function fmt(x, suffix) {{
-    if (suffix === undefined) suffix = '';
-    if (x === null || x === undefined) return '—';
-    return String(x) + suffix;
-  }}
+function appendLog(line) {
+  var el = $('log');
+  el.textContent += line;
+  el.textContent += String.fromCharCode(10);
+  el.scrollTop = el.scrollHeight;
+}
 
-  function appendLog(line) {{
-    var el = $('log');
-    el.textContent += line;
-    el.textContent += String.fromCharCode(10);
-    el.scrollTop = el.scrollHeight;
-  }}
+function addRow(e) {
+  var d = e.data || {};
+  var amber = (d.sources && d.sources.amber) ? d.sources.amber : {};
+  var dec = d.decision || {};
 
-  function addRow(e) {{
-    var d = e.data || {{}};
-    var amber = (d.sources && d.sources.amber) ? d.sources.amber : {{}};
-    var dec = d.decision || {{}};
+  var tr = document.createElement('tr');
+  tr.innerHTML =
+    '<td>' + e.id + '</td>' +
+    '<td>' + fmt(e.ts_local) + '</td>' +
+    '<td>' + fmt(amber.feedin_c, 'c') + '</td>' +
+    '<td>' + String(dec.export_costs) + '</td>' +
+    '<td>' + fmt(dec.want_pct, '%') + '</td>' +
+    '<td>' + String((dec.reason || '')).slice(0, 80) + '</td>';
 
-    var tr = document.createElement('tr');
-    tr.innerHTML =
-      '<td>' + e.id + '</td>' +
-      '<td>' + fmt(e.ts_local) + '</td>' +
-      '<td>' + fmt(amber.feedin_c, 'c') + '</td>' +
-      '<td>' + String(dec.export_costs) + '</td>' +
-      '<td>' + fmt(dec.want_pct, '%') + '</td>' +
-      '<td>' + String((dec.reason || '')).slice(0, 80) + '</td>';
+  var rows = $('rows');
+  if (rows.firstChild) rows.insertBefore(tr, rows.firstChild);
+  else rows.appendChild(tr);
 
-    var rows = $('rows');
-    rows.prepend(tr);
-    while (rows.children.length > 50) rows.removeChild(rows.lastChild);
-  }}
+  while (rows.children.length > 50) rows.removeChild(rows.lastChild);
+}
 
-  function render(e) {{
-    var d = e.data || {{}};
+function render(e) {
+  var d = e.data || {};
 
-    var amber = (d.sources && d.sources.amber) ? d.sources.amber : {{}};
-    var alpha = (d.sources && d.sources.alpha) ? d.sources.alpha : {{}};
-    var gw = (d.sources && d.sources.goodwe) ? d.sources.goodwe : {{}};
+  var amber = (d.sources && d.sources.amber) ? d.sources.amber : {};
+  var alpha = (d.sources && d.sources.alpha) ? d.sources.alpha : {};
+  var gw = (d.sources && d.sources.goodwe) ? d.sources.goodwe : {};
 
-    var dec = d.decision || {{
-      export_costs: Boolean(e.export_costs),
-      want_pct: e.want_pct,
-      want_enabled: e.want_enabled,
-      reason: e.reason,
-      target_w: undefined
-    }};
+  var dec = d.decision || {
+    export_costs: Boolean(e.export_costs),
+    want_pct: e.want_pct,
+    want_enabled: e.want_enabled,
+    reason: e.reason,
+    target_w: undefined
+  };
 
-    var act = d.actuation || {{}};
+  var act = d.actuation || {};
 
-    $('export_costs').innerHTML = dec.export_costs ? pill(false, 'true (costs)') : pill(true, 'false (ok)');
-    $('want_limit').textContent = fmt(dec.want_pct, '%') + (dec.target_w ? (' (~' + fmt(dec.target_w, 'W') + ')') : '');
-    $('want_enabled').textContent = fmt(dec.want_enabled);
-    $('reason').textContent = fmt(dec.reason);
-    $('write').textContent = act.write_attempted ? (act.write_ok ? 'ok' : ('failed: ' + fmt(act.write_error))) : 'not attempted';
+  $('export_costs').innerHTML = dec.export_costs ? pill(false, 'true (costs)') : pill(true, 'false (ok)');
+  $('want_limit').textContent = fmt(dec.want_pct, '%') + (dec.target_w ? (' (~' + fmt(dec.target_w, 'W') + ')') : '');
+  $('want_enabled').textContent = fmt(dec.want_enabled);
+  $('reason').textContent = fmt(dec.reason);
+  $('write').textContent = act.write_attempted ? (act.write_ok ? 'ok' : ('failed: ' + fmt(act.write_error))) : 'not attempted';
 
-    $('amber_feedin').textContent = fmt(amber.feedin_c, 'c');
-    $('amber_import').textContent = fmt(amber.import_c, 'c');
-    $('amber_age').textContent = fmt(amber.age_s, 's');
-    $('amber_end').textContent = fmt(amber.interval_end_utc);
+  $('amber_feedin').textContent = fmt(amber.feedin_c, 'c');
+  $('amber_import').textContent = fmt(amber.import_c, 'c');
+  $('amber_age').textContent = fmt(amber.age_s, 's');
+  $('amber_end').textContent = fmt(amber.interval_end_utc);
 
-    $('alpha_soc').textContent = fmt(alpha.soc_pct, '%');
-    $('alpha_pload').textContent = fmt(alpha.pload_w, 'W');
-    $('alpha_pbat').textContent = fmt(alpha.pbat_w, 'W');
-    $('alpha_pgrid').textContent = fmt(alpha.pgrid_w, 'W');
-    $('alpha_age').textContent = fmt(alpha.age_s, 's');
+  $('alpha_soc').textContent = fmt(alpha.soc_pct, '%');
+  $('alpha_pload').textContent = fmt(alpha.pload_w, 'W');
+  $('alpha_pbat').textContent = fmt(alpha.pbat_w, 'W');
+  $('alpha_pgrid').textContent = fmt(alpha.pgrid_w, 'W');
+  $('alpha_age').textContent = fmt(alpha.age_s, 's');
 
-    $('gw_gen').textContent = fmt(gw.gen_w, 'W');
-    $('gw_feed').textContent = fmt(gw.feed_w, 'W');
-    $('gw_temp').textContent = fmt(gw.temp_c, 'C');
-    $('gw_meter').textContent = fmt(gw.meter_ok);
-    $('gw_wifi').textContent = fmt(gw.wifi_pct, '%');
+  $('gw_gen').textContent = fmt(gw.gen_w, 'W');
+  $('gw_feed').textContent = fmt(gw.feed_w, 'W');
+  $('gw_temp').textContent = fmt(gw.temp_c, 'C');
+  $('gw_meter').textContent = fmt(gw.meter_ok);
+  $('gw_wifi').textContent = fmt(gw.wifi_pct, '%');
 
-    appendLog('[' + e.ts_local + '] feedIn=' + fmt(amber.feedin_c,'c') +
-              ' export_costs=' + String(dec.export_costs) +
-              ' want=' + fmt(dec.want_pct,'%') +
-              ' enabled=' + fmt(dec.want_enabled) +
-              ' reason=' + String(dec.reason || ''));
+  appendLog('[' + e.ts_local + '] feedIn=' + fmt(amber.feedin_c,'c') +
+            ' export_costs=' + String(dec.export_costs) +
+            ' want=' + fmt(dec.want_pct,'%') +
+            ' enabled=' + fmt(dec.want_enabled) +
+            ' reason=' + String(dec.reason || ''));
 
-    addRow(e);
-  }}
+  addRow(e);
+}
 
-  function httpGetJson(url, onOk, onErr) {{
-    try {{
-      var xhr = new XMLHttpRequest();
-      xhr.open('GET', url, true);
-      xhr.setRequestHeader('Cache-Control', 'no-store');
-      xhr.onreadystatechange = function() {{
-        if (xhr.readyState !== 4) return;
-        if (xhr.status >= 200 && xhr.status < 300) {{
-          try {{
-            onOk(JSON.parse(xhr.responseText));
-          }} catch (e) {{
-            onErr('JSON parse failed: ' + e);
-          }}
-        }} else {{
-          onErr('HTTP ' + xhr.status + ' ' + xhr.statusText + ' body=' + xhr.responseText);
-        }}
-      }};
-      xhr.send(null);
-    }} catch (e) {{
-      onErr('XHR failed: ' + e);
-    }}
-  }}
+function httpGetJson(url, onOk, onErr) {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    xhr.setRequestHeader('Cache-Control', 'no-store');
+    xhr.onreadystatechange = function() {
+      if (xhr.readyState !== 4) return;
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          onOk(JSON.parse(xhr.responseText));
+        } catch (e) {
+          onErr('JSON parse failed: ' + e);
+        }
+      } else {
+        onErr('HTTP ' + xhr.status + ' ' + xhr.statusText + ' body=' + xhr.responseText);
+      }
+    };
+    xhr.send(null);
+  } catch (e) {
+    onErr('XHR failed: ' + e);
+  }
+}
 
-  function init() {{
-    var baseLabel = (API_BASE && API_BASE.length) ? API_BASE : window.location.origin;
-    $('status').textContent = 'API ' + MODE + ': ' + baseLabel;
+function init() {
+  var baseLabel = (API_BASE && API_BASE.length) ? API_BASE : window.location.origin;
+  $('status').textContent = 'API ' + MODE + ': ' + baseLabel;
 
-    httpGetJson((API_BASE || '') + '/api/events/latest',
-      function(e) {{
-        try {{
-          window.__lastId = e.id || 0;
-          render(e);
-        }} catch (err) {{
-          showError('render(latest) failed: ' + (err && err.stack ? err.stack : err));
-          return;
-        }}
+  httpGetJson((API_BASE || '') + '/api/events/latest',
+    function(e) {
+      try {
+        window.__lastId = e.id || 0;
+        render(e);
+      } catch (err) {
+        showError('render(latest) failed: ' + (err && err.stack ? err.stack : err));
+        return;
+      }
 
-        // SSE connect after initial render
-        try {{
-          var esUrl = (API_BASE || '') + '/api/sse/events?after_id=' + window.__lastId;
-          appendLog('connecting SSE: ' + esUrl);
-          var es = new EventSource(esUrl);
+      try {
+        var esUrl = (API_BASE || '') + '/api/sse/events?after_id=' + window.__lastId;
+        appendLog('connecting SSE: ' + esUrl);
+        var es = new EventSource(esUrl);
 
-          es.addEventListener('event', function(msg) {{
-            try {{
-              var ev = JSON.parse(msg.data);
-              window.__lastId = Math.max(window.__lastId, ev.id || 0);
-              render(ev);
-              $('status').textContent = 'connected ' + MODE + ' (last id: ' + window.__lastId + ')';
-            }} catch (err) {{
-              showError('SSE parse/render error: ' + (err && err.stack ? err.stack : err) + '\nraw: ' + msg.data);
-            }}
-          }});
+        es.addEventListener('event', function(msg) {
+          try {
+            var ev = JSON.parse(msg.data);
+            window.__lastId = Math.max(window.__lastId, ev.id || 0);
+            render(ev);
+            $('status').textContent = 'connected ' + MODE + ' (last id: ' + window.__lastId + ')';
+          } catch (err) {
+            showError('SSE parse/render error: ' + (err && err.stack ? err.stack : err) + '\nraw: ' + msg.data);
+          }
+        });
 
-          es.onerror = function() {{
-            $('status').textContent = 'disconnected ' + MODE + ' - retrying...';
-          }};
-        }} catch (e) {{
-          showError('EventSource failed: ' + e);
-        }}
-      }},
-      function(errmsg) {{
-        showError('GET /api/events/latest failed: ' + errmsg);
-        $('status').textContent = 'API unreachable ' + MODE + ': ' + baseLabel;
-      }}
-    );
-  }}
+        es.onerror = function() {
+          $('status').textContent = 'disconnected ' + MODE + ' - retrying...';
+        };
+      } catch (e) {
+        showError('EventSource failed: ' + e);
+      }
+    },
+    function(errmsg) {
+      showError('GET /api/events/latest failed: ' + errmsg);
+      $('status').textContent = 'API unreachable ' + MODE + ': ' + baseLabel;
+    }
+  );
+}
 
-  try {{
-    init();
-  }} catch (e) {{
-    showError('init threw: ' + (e && e.stack ? e.stack : e));
-  }}
+try {
+  init();
+} catch (e) {
+  showError('init threw: ' + (e && e.stack ? e.stack : e));
+}
 </script>
 </body>
-</html>"""
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> str:
+    # If we are proxying, the browser should use relative paths (same origin).
+    # Otherwise, it should connect directly to UI_API_BASE.
+    api_base_for_browser = "" if UI_PROXY_API else _env("UI_API_BASE", "")
+    proxy_banner = "proxied" if UI_PROXY_API else "direct"
+
+    html = _HTML_TEMPLATE
+    html = html.replace("__API_BASE__", json.dumps(api_base_for_browser))
+    html = html.replace("__MODE__", json.dumps(proxy_banner))
+    return html
 
 
 if __name__ == "__main__":
