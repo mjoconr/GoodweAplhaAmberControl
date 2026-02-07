@@ -205,4 +205,81 @@ Set:
 This controller can materially affect inverter output.
 Test carefully, start with conservative settings, and monitor logs when making changes.
 
+
+
+---
+
+## Pattern 2 stack (JSON export ➜ SQLite ➜ API+SSE ➜ UI)
+
+This repository can run as four small processes:
+
+1) **control.py** (controller) writes 1 JSON file per loop into `EVENT_EXPORT_DIR`.
+2) **ingest_to_sqlite.py** watches that directory and imports events into SQLite (`INGEST_DB_PATH`).
+3) **api_server.py** exposes a small HTTP API + **SSE** stream backed by SQLite.
+4) **ui_server.py** serves a simple live web UI that connects to the API.
+
+### Run without systemd (dev/test)
+
+In one terminal:
+
+```bash
+set -a; source .env; set +a
+python3 control.py
+```
+
+In a second terminal:
+
+```bash
+set -a; source .env; set +a
+python3 ingest_to_sqlite.py
+```
+
+In a third terminal:
+
+```bash
+set -a; source .env; set +a
+python3 api_server.py
+```
+
+In a fourth terminal:
+
+```bash
+set -a; source .env; set +a
+python3 ui_server.py
+```
+
+Then open:
+
+- UI: `http://<pi-ip>:8000/`
+- API health: `http://127.0.0.1:8001/api/health`
+
+### Notes
+
+- **Atomic export**: `control.py` writes `*.json.tmp` then renames to `*.json`, so the ingest process never sees partial files.
+- **Idempotent import**: events have `event_id` and SQLite enforces uniqueness so re-running the ingester is safe.
+- **SQLite WAL mode**: while the ingester is running, SQLite writes new pages into `events.sqlite3-wal` and may not immediately grow `events.sqlite3`. This is normal. The ingester periodically checkpoints/truncates the WAL so the main DB stays up to date and the WAL stays bounded.
+  - To force it manually: `sqlite3 data/events.sqlite3 "PRAGMA wal_checkpoint(TRUNCATE);"`
+- **CORS**: if the UI and API are on different origins (host/port), set `API_CORS_ORIGINS`.
+
+---
+
+## systemd
+
+Example unit files are provided in `systemd/`.
+
+Typical install (system services):
+
+```bash
+sudo mkdir -p /etc/systemd/system
+sudo cp systemd/*.service systemd/*.target /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now goodwe-stack.target
+```
+
+**Important:** edit the unit files first to match:
+
+- your project path (default assumes `/home/pi/goodwe_local_control`)
+- your venv python path
+- the `.env` file location
+
 ```

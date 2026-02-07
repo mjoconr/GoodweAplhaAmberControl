@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 
 def _env(name: str, default: str = "") -> str:
@@ -26,6 +26,16 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
 def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
     if v is None or v == "":
@@ -33,14 +43,28 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _wal_path(db_path: Path) -> Path:
+    # SQLite WAL file naming is "<db>-wal"
+    return Path(str(db_path) + "-wal")
+
+
 def _init_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Keep one writer connection open for performance, but ensure WAL checkpoints happen.
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
 
     # Better concurrency characteristics for a read-heavy UI process.
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+
+    # Reduce the surprise of a tiny main DB file with a large -wal file.
+    # Default SQLite autocheckpoint is 1000 pages (~4MB at 4KB pages). We use a smaller default.
+    conn.execute(f"PRAGMA wal_autocheckpoint={_env_int('INGEST_WAL_AUTOCHECKPOINT_PAGES', 200)}")
+
+    # Avoid transient lock failures if the API/UI hit the DB at the same time.
+    conn.execute(f"PRAGMA busy_timeout={_env_int('INGEST_BUSY_TIMEOUT_MS', 5000)}")
 
     conn.execute(
         """
@@ -104,6 +128,7 @@ def _extract_columns(event: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
 
 
 def _ingest_one(conn: sqlite3.Connection, json_path: Path) -> bool:
+    """Return True if the file was valid and handled (inserted or already present)."""
     try:
         with open(json_path, "r", encoding="utf-8") as f:
             event = json.load(f)
@@ -114,12 +139,14 @@ def _ingest_one(conn: sqlite3.Connection, json_path: Path) -> bool:
         if not cols.get("event_id"):
             return False
 
-        cur = conn.execute(
+        # Treat duplicates as success so we still move/delete the file.
+        conn.execute(
             """
-            INSERT OR IGNORE INTO events(
+            INSERT INTO events(
                 event_id, ts_utc, ts_local, ts_epoch_ms, host, pid, loop,
                 export_costs, want_pct, want_enabled, reason, data_json
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO NOTHING
             """,
             (
                 cols.get("event_id"),
@@ -137,7 +164,7 @@ def _ingest_one(conn: sqlite3.Connection, json_path: Path) -> bool:
             ),
         )
         conn.commit()
-        return cur.rowcount == 1
+        return True
     except Exception:
         return False
 
@@ -149,6 +176,20 @@ def _move_processed(src: Path, processed_dir: Path) -> None:
     if dst.exists():
         dst = processed_dir / f"{src.stem}.dup{int(time.time())}{src.suffix}"
     shutil.move(str(src), str(dst))
+
+
+def _maybe_checkpoint(conn: sqlite3.Connection, db_path: Path, truncate_mb: int) -> None:
+    wal = _wal_path(db_path)
+    wal_bytes = wal.stat().st_size if wal.exists() else 0
+
+    # TRUNCATE keeps the -wal file from growing indefinitely and makes the main DB reflect changes.
+    # If there are active readers, TRUNCATE may not fully truncate; that's fine.
+    mode = "TRUNCATE" if wal_bytes >= int(truncate_mb) * 1024 * 1024 else "PASSIVE"
+    try:
+        conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+    except Exception:
+        # Never crash the ingester due to checkpoint issues.
+        pass
 
 
 def main() -> int:
@@ -167,19 +208,31 @@ def main() -> int:
     export_dir.mkdir(parents=True, exist_ok=True)
     conn = _init_db(db_path)
 
-    print(f"[ingest] export_dir={export_dir} processed_dir={processed_dir} db={db_path} delete={bool(args.delete)}")
+    ckpt_every = _env_float("INGEST_WAL_CHECKPOINT_SEC", 30.0)
+    truncate_mb = _env_int("INGEST_WAL_TRUNCATE_MB", 16)
+    last_ckpt = time.monotonic()
+
+    print(
+        f"[ingest] export_dir={export_dir} processed_dir={processed_dir} db={db_path} "
+        f"delete={bool(args.delete)} ckpt={ckpt_every}s truncate_mb={truncate_mb}"
+    )
 
     try:
         while True:
             # Only ingest stable .json files (control.py writes via atomic rename).
             paths = sorted(p for p in export_dir.glob("*.json") if p.is_file())
             if not paths:
+                # Still checkpoint occasionally so the main DB stays up to date.
+                now = time.monotonic()
+                if ckpt_every > 0 and (now - last_ckpt) >= ckpt_every:
+                    _maybe_checkpoint(conn, db_path, truncate_mb)
+                    last_ckpt = now
                 time.sleep(max(0.2, float(args.poll)))
                 continue
 
             for path in paths:
-                inserted = _ingest_one(conn, path)
-                if inserted:
+                ok = _ingest_one(conn, path)
+                if ok:
                     if args.delete:
                         try:
                             path.unlink(missing_ok=True)
@@ -201,12 +254,22 @@ def main() -> int:
                     except Exception:
                         pass
 
+            now = time.monotonic()
+            if ckpt_every > 0 and (now - last_ckpt) >= ckpt_every:
+                _maybe_checkpoint(conn, db_path, truncate_mb)
+                last_ckpt = now
+
             time.sleep(max(0.1, float(args.poll)))
 
     except KeyboardInterrupt:
         print("[ingest] stopping")
         return 0
     finally:
+        try:
+            # A final truncate checkpoint so the main DB file contains all recent changes.
+            _maybe_checkpoint(conn, db_path, truncate_mb=0)
+        except Exception:
+            pass
         try:
             conn.close()
         except Exception:
