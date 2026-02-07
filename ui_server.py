@@ -3,13 +3,19 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import os
 import sqlite3
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from logging_setup import setup_logging
+
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
+
+
+logger = logging.getLogger("ui")
 
 
 def _env(name: str, default: str = "") -> str:
@@ -172,6 +178,7 @@ async def proxy_api(path: str, request: Request) -> Response:
             media_type=resp.headers.get("content-type"),
         )
     except Exception as e:
+        logger.exception("proxy_api upstream error method=%s path=%s url=%s", request.method, path, url)
         return Response(status_code=502, content=f"Upstream API error: {e}".encode("utf-8"))
 
 
@@ -203,6 +210,7 @@ def _load_latest_and_recent(limit: int = 50) -> Tuple[Optional[Dict[str, Any]], 
     try:
         conn = _db_connect(DB_PATH)
     except Exception as e:
+        logger.exception("db open failed db=%s", DB_PATH)
         return None, [], f"db open failed: {e}"
 
     try:
@@ -215,6 +223,7 @@ def _load_latest_and_recent(limit: int = 50) -> Tuple[Optional[Dict[str, Any]], 
         recent = [_row_to_event(r) for r in rows]
         return latest, recent, None
     except Exception as e:
+        logger.exception("db query failed db=%s", DB_PATH)
         return None, [], f"db query failed: {e}"
     finally:
         try:
@@ -1895,6 +1904,8 @@ _CHARTJS_APP_JS = r"""(function() {
 
 @app.get("/js_ping")
 def js_ping() -> Response:
+    # Used by the browser to confirm JS executed.
+    logger.debug("js_ping")
     return Response(content=b"ok", media_type="text/plain", headers={"cache-control": "no-store"})
 
 
@@ -2027,6 +2038,13 @@ def app_js() -> Response:
 if __name__ == "__main__":
     import uvicorn
 
+    # Rotating file logs (LOG_DIR/ui.log) + optional stdout
+    debug_default = _env("DEBUG", "").strip().lower() in ("1", "true", "yes", "y", "on")
+    setup_logging("ui", debug_default=debug_default)
+
     host = _env("UI_HOST", "0.0.0.0")
     port = _env_int("UI_PORT", 8000)
-    uvicorn.run(app, host=host, port=port, log_level="info")
+
+    logger.info("[start] ui host=%s port=%s api_upstream=%s ui_proxy_api=%s db=%s", host, port, API_UPSTREAM, UI_PROXY_API, DB_PATH)
+
+    uvicorn.run(app, host=host, port=port, log_level="info", log_config=None)
