@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict, Iterable, Optional
+from contextlib import asynccontextmanager
+from typing import Dict, Iterable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
@@ -37,14 +38,8 @@ API_UPSTREAM = _env("UI_API_UPSTREAM", _env("UI_API_BASE", "http://127.0.0.1:800
 # This avoids the common pitfall where the browser tries to connect to 127.0.0.1 (its own machine).
 UI_PROXY_API = _env_bool("UI_PROXY_API", "1")
 
-app = FastAPI(title="GoodWe Control UI")
 
-
-# -------------------------
-# Reverse proxy (optional)
-# -------------------------
-
-_httpx_client = None  # created lazily on first request
+_httpx_client = None  # created lazily
 
 
 def _hop_by_hop_headers() -> set:
@@ -83,14 +78,24 @@ async def _get_httpx():
     return _httpx_client
 
 
-@app.on_event("shutdown")
-async def _shutdown_httpx() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # startup: nothing
+    yield
+    # shutdown: close httpx client
     global _httpx_client
     if _httpx_client is not None:
         try:
             await _httpx_client.aclose()
         finally:
             _httpx_client = None
+
+
+app = FastAPI(title="GoodWe Control UI", lifespan=lifespan)
+
+# -------------------------
+# Reverse proxy (optional)
+# -------------------------
 
 
 @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])  # type: ignore[misc]
@@ -114,28 +119,58 @@ async def proxy_api(path: str, request: Request) -> Response:
     body = await request.body()
     headers = _filter_headers(request.headers.items())
 
-    # Best-effort: preserve Accept so SSE keeps correct content type.
-    try:
-        async with client.stream(
-            request.method,
-            url,
-            params=dict(request.query_params),
-            content=body if body else None,
-            headers=headers,
-        ) as resp:
-            resp_headers = _filter_headers(resp.headers.items())
+    # Decide if we must stream (SSE endpoint or Accept: text/event-stream).
+    accept = request.headers.get("accept", "").lower()
+    want_stream = path.startswith("sse/") or "text/event-stream" in accept
 
-            # NOTE: do not set content-length when streaming.
+    try:
+        if want_stream:
+            # Use stream=True so we can relay SSE without buffering and without closing the upstream early.
+            req = client.build_request(
+                request.method,
+                url,
+                params=dict(request.query_params),
+                headers=headers,
+                content=body if body else None,
+            )
+            resp = await client.send(req, stream=True)
+
+            resp_headers = _filter_headers(resp.headers.items())
             resp_headers.pop("content-length", None)
 
             media_type = resp.headers.get("content-type")
 
+            async def _iter():
+                try:
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+                finally:
+                    await resp.aclose()
+
             return StreamingResponse(
-                resp.aiter_bytes(),
+                _iter(),
                 status_code=resp.status_code,
                 headers=resp_headers,
                 media_type=media_type,
             )
+
+        # Non-streaming: buffer response content.
+        resp = await client.request(
+            request.method,
+            url,
+            params=dict(request.query_params),
+            headers=headers,
+            content=body if body else None,
+        )
+        resp_headers = _filter_headers(resp.headers.items())
+        content = resp.content
+        media_type = resp.headers.get("content-type")
+        return Response(
+            content=content,
+            status_code=resp.status_code,
+            headers=resp_headers,
+            media_type=media_type,
+        )
     except Exception as e:
         return Response(status_code=502, content=f"Upstream API error: {e}".encode("utf-8"))
 
