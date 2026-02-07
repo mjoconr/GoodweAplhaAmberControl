@@ -97,14 +97,55 @@ def latest_event() -> JSONResponse:
 
 @app.get("/api/events")
 def list_events(
-    limit: int = Query(200, ge=1, le=5000),
+    limit: int = Query(200, ge=1, le=20000),
     after_id: int = Query(0, ge=0),
+    # Optional time-window filters (useful for UIs that show “last N hours”):
+    # - hours: return events newer than now - hours
+    # - since_epoch_ms: return events newer than this epoch-ms timestamp
+    #
+    # If `hours`/`since_epoch_ms` are provided and `limit` is left at the default (200),
+    # we automatically raise the effective limit so the UI can actually fill the window.
+    hours: Optional[float] = Query(None, ge=0),
+    since_epoch_ms: Optional[int] = Query(None, ge=0),
 ) -> JSONResponse:
+    # Compute cutoff (epoch ms) if the caller requested a window.
+    cutoff_ms: Optional[int] = None
+    if since_epoch_ms is not None:
+        cutoff_ms = int(since_epoch_ms)
+    elif hours is not None:
+        cutoff_ms = int(time.time() * 1000.0 - float(hours) * 3600.0 * 1000.0)
+
+    effective_limit = int(limit)
+    if cutoff_ms is not None and int(limit) == 200:
+        # Common UI bug: the frontend filters locally to 24h, but only fetches 200 rows,
+        # which is often ~30–60 minutes depending on loop interval. Make it “just work”.
+        effective_limit = 20000
+
     conn = _db_connect(DB_PATH)
     try:
+        # If the client is doing incremental paging (after_id>0), preserve the old semantics.
+        if cutoff_ms is None:
+            rows = conn.execute(
+                "SELECT * FROM events WHERE id > ? ORDER BY id ASC LIMIT ?",
+                (int(after_id), int(effective_limit)),
+            ).fetchall()
+            return JSONResponse(content={"events": [_row_to_dict(r) for r in rows]})
+
+        if int(after_id) > 0:
+            rows = conn.execute(
+                "SELECT * FROM events WHERE id > ? AND ts_epoch_ms >= ? ORDER BY id ASC LIMIT ?",
+                (int(after_id), int(cutoff_ms), int(effective_limit)),
+            ).fetchall()
+            return JSONResponse(content={"events": [_row_to_dict(r) for r in rows]})
+
+        # Initial window load (after_id==0): return the newest rows within the window,
+        # then reverse to keep chronological ordering in the UI.
         rows = conn.execute(
-            "SELECT * FROM events WHERE id > ? ORDER BY id ASC LIMIT ?", (int(after_id), int(limit))
+            "SELECT * FROM events WHERE ts_epoch_ms >= ? ORDER BY id DESC LIMIT ?",
+            (int(cutoff_ms), int(effective_limit)),
         ).fetchall()
+        rows = list(rows)
+        rows.reverse()
         return JSONResponse(content={"events": [_row_to_dict(r) for r in rows]})
     finally:
         conn.close()
