@@ -8,9 +8,12 @@ import json
 import math
 import hashlib
 import logging
+import socket
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone, date
 from typing import Any, Dict, Optional, Tuple, List
+from pathlib import Path
 
 import requests
 
@@ -119,6 +122,62 @@ def _clamp_int(x: int, lo: int, hi: int) -> int:
     return x
 
 
+
+
+# -------------------- Event export (JSON files) --------------------
+
+
+def _utc_iso_z(ts: float | None = None) -> str:
+    dt = datetime.fromtimestamp(ts or time.time(), tz=timezone.utc)
+    # millisecond precision is plenty, and produces stable filenames
+    return dt.replace(microsecond=int(dt.microsecond / 1000) * 1000).isoformat().replace('+00:00', 'Z')
+
+
+class EventExporter:
+    """Append-only JSON event exporter for the control loop.
+
+    Writes one JSON file per loop iteration using an atomic rename so external
+    processes never see partial files.
+    """
+
+    def __init__(self, enabled: bool, out_dir: str):
+        self.enabled = bool(enabled)
+        self.out_dir = Path(out_dir).expanduser()
+        if self.enabled:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+
+    def emit(self, event: Dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        try:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            event_id = str(event.get('event_id') or uuid.uuid4())
+
+            # Prefer epoch_ms for easy sorting across timezones
+            epoch_ms = int((event.get('ts_epoch_ms') or (time.time() * 1000.0)))
+            name = f"{epoch_ms:013d}_{event_id}.json"
+            tmp = self.out_dir / (name + '.tmp')
+            out = self.out_dir / name
+
+            payload = dict(event)
+            payload.setdefault('event_id', event_id)
+            payload.setdefault('ts_epoch_ms', epoch_ms)
+
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, separators=(',', ':'))
+                f.write("\n")
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+
+            # Atomic on POSIX when within same filesystem/dir
+            tmp.replace(out)
+        except Exception:
+            # Never let export failures crash the control loop
+            return
+
 # -------------------- Configuration --------------------
 
 # Amber
@@ -159,6 +218,11 @@ MIN_PCT_STEP = _env_int("MIN_PCT_STEP", 1)
 LIMIT_SMOOTHING = _env_float("LIMIT_SMOOTHING", 0.2)
 
 DEBUG = _env_bool("DEBUG", False)
+
+# Event export
+EVENT_EXPORT_ENABLED = _env_bool("EVENT_EXPORT_ENABLED", True)
+EVENT_EXPORT_DIR = _env("EVENT_EXPORT_DIR", "export/events")
+
 
 # Reduce noisy pymodbus console output unless DEBUG is enabled.
 # (Some pymodbus versions emit "Exception response ..." at ERROR level.)
@@ -1643,6 +1707,9 @@ def main() -> int:
         always_enabled=GOODWE_ALWAYS_ENABLED,
     )
 
+    exporter = EventExporter(EVENT_EXPORT_ENABLED, EVENT_EXPORT_DIR)
+    host = socket.gethostname()
+
     alpha_poller: Optional[AlphaEssOpenApiPoller] = None
     if ALPHAESS_OPENAPI_ENABLED:
         try:
@@ -1670,9 +1737,11 @@ def main() -> int:
 
     last_limit_state: Optional[Tuple[int, int]] = None  # (enabled, pct)
     last_write_ts = 0.0
+    loop_counter = 0
 
     try:
         while True:
+            loop_counter += 1
             try:
                 # ---- Amber (slow, interval-based) ----
                 amber_snap = amber_poller.get_snapshot() if amber_poller else None
@@ -1881,15 +1950,97 @@ def main() -> int:
                     elif abs(int(prev_pct2) - int(want_pct)) >= int(MIN_PCT_STEP):
                         need_write = True
 
+                write_attempted = False
+                write_ok = False
+                write_error: Optional[str] = None
+
                 if can_write and need_write:
+                    write_attempted = True
                     try:
                         limiter.set_limit_pct(bool(want_enabled), int(want_pct))
                         last_limit_state = (want_enabled, want_pct)
                         last_write_ts = now
+                        write_ok = True
                     except Exception as e:
+                        write_error = str(e)
                         print(f"  [goodwe] write failed: {e}")
                 elif not can_write and DEBUG:
                     print("  [goodwe] skipping write (rate limited)")
+
+                # ---- Export structured decision event (best effort) ----
+                try:
+                    ts_utc = _utc_iso_z(now)
+                    ts_local = datetime.fromtimestamp(now, tz=timezone.utc).astimezone().isoformat()
+
+                    event: Dict[str, Any] = {
+                        'schema': 1,
+                        'event_id': str(uuid.uuid4()),
+                        'ts_utc': ts_utc,
+                        'ts_local': ts_local,
+                        'ts_epoch_ms': int(now * 1000.0),
+                        'host': host,
+                        'pid': os.getpid(),
+                        'loop': int(loop_counter),
+                        'sources': {
+                            'amber': {
+                                'state': amber_state,
+                                'age_s': amber_age_s,
+                                'interval_end_utc': amber_interval_end.isoformat() + 'Z' if amber_interval_end else None,
+                                'import_c': import_c,
+                                'feedin_c': feed_c,
+                                'import_power_w': amber_import_w,
+                                'feedin_power_w': amber_feed_w,
+                                'raw_prices': amber_snap.raw_prices if amber_snap else None,
+                                'raw_usage': amber_snap.raw_usage if amber_snap else None,
+                                'error': amber_err,
+                            },
+                            'goodwe': {
+                                'gen_w': gen_w,
+                                'pv_est_w': pv_est_w,
+                                'feed_w': feed_w,
+                                'pwr_limit_fn': pwr_limit_fn,
+                                'meter_ok': meter_ok,
+                                'wifi_pct': wifi,
+                                'temp_c': temp_c,
+                                'current_limit': current_limit,
+                                'profile': RUNTIME_PROFILE,
+                            },
+                            'alpha': {
+                                'enabled': bool(alpha_poller is not None),
+                                'ok': alpha_ok,
+                                'age_s': alpha_age_s,
+                                'sys_sn': alpha_snap.sys_sn if alpha_snap else None,
+                                'soc_pct': alpha_snap.soc_pct if alpha_snap else None,
+                                'batt_state': alpha_snap.batt_state if alpha_snap else None,
+                                'pload_w': alpha_snap.pload_w if alpha_snap else None,
+                                'pbat_w': alpha_snap.pbat_w if alpha_snap else None,
+                                'pgrid_w': alpha_snap.pgrid_w if alpha_snap else None,
+                                'charge_w': alpha_snap.charge_w if alpha_snap else None,
+                                'discharge_w': alpha_snap.discharge_w if alpha_snap else None,
+                                'raw': alpha_snap.raw if alpha_snap else None,
+                                'error': alpha_poller.get_last_error() if alpha_poller else None,
+                            },
+                        },
+                        'decision': {
+                            'export_costs': bool(export_costs),
+                            'export_cost_threshold_c': EXPORT_COST_THRESHOLD_C,
+                            'target_w': int(target_w),
+                            'want_pct': int(want_pct),
+                            'want_enabled': int(want_enabled),
+                            'reason': str(target_reason),
+                            'need_write': bool(need_write),
+                            'can_write': bool(can_write),
+                        },
+                        'actuation': {
+                            'write_attempted': bool(write_attempted),
+                            'write_ok': bool(write_ok),
+                            'write_error': write_error,
+                        },
+                    }
+
+                    exporter.emit(event)
+                except Exception:
+                    pass
 
             except Exception as e:
                 print(f"[error] {e}")
