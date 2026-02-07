@@ -18,3 +18,5 @@ typing-extensions
 urllib3
 voluptuous
 yarl
+fastapi
+uvicorn
