@@ -173,7 +173,7 @@ def index() -> str:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>GoodWe Control — Live</title>
+  <title>GoodWe Control - Live</title>
   <style>
     body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #0b0f14; color: #e6edf3; }}
     header {{ padding: 12px 16px; border-bottom: 1px solid #202938; display: flex; gap: 12px; align-items: baseline; }}
@@ -200,7 +200,7 @@ def index() -> str:
 </head>
 <body>
   <header>
-    <h1>GoodWe Control — Live</h1>
+    <h1>GoodWe Control - Live</h1>
     <div class="status" id="status">connecting...</div>
   </header>
 
@@ -279,150 +279,195 @@ def index() -> str:
   </main>
 
 <script>
-const API_BASE = {api_base_js};
-const MODE = {proxy_banner_js};
-const $ = (id) => document.getElementById(id);
-let lastId = 0;
+  // NOTE: We intentionally keep this JS fairly "old" for maximum compatibility
+  // (no optional chaining, no async/await, no template literals required).
 
-function showError(msg) {{
-  const box = $('errorBox');
-  const pre = $('errorText');
-  box.style.display = 'block';
-  pre.textContent = msg;
-}}
+  var API_BASE = {api_base_js};
+  var MODE = {proxy_banner_js};
 
-window.addEventListener('error', (e) => {{
-  showError(`error: ${{e.message}}\n${{e.filename}}:${{e.lineno}}:${{e.colno}}`);
-}});
+  function $(id) {{ return document.getElementById(id); }}
 
-window.addEventListener('unhandledrejection', (e) => {{
-  showError(`unhandledrejection: ${{String(e.reason)}}`);
-}});
-
-function pill(ok, text) {{
-  const cls = ok === true ? 'pill ok' : (ok === false ? 'pill bad' : 'pill warn');
-  return `<span class="${{cls}}">${{text}}</span>`;
-}}
-
-function fmt(x, suffix='') {{
-  if (x === null || x === undefined) return '—';
-  return `${{x}}${{suffix}}`;
-}}
-
-function appendLog(line) {{
-  const el = $('log');
-  el.textContent += line + "\n";
-  el.scrollTop = el.scrollHeight;
-}}
-
-function addRow(e) {{
-  const d = e.data || {{}};
-  const amber = (d.sources && d.sources.amber) || {{}};
-  const dec = d.decision || {{}};
-  const tr = document.createElement('tr');
-  tr.innerHTML = `
-    <td>${{e.id}}</td>
-    <td>${{fmt(e.ts_local)}}</td>
-    <td>${{fmt(amber.feedin_c, 'c')}}</td>
-    <td>${{String(dec.export_costs)}}</td>
-    <td>${{fmt(dec.want_pct, '%')}}</td>
-    <td>${{(dec.reason || '').toString().slice(0, 80)}}</td>
-  `;
-  const rows = $('rows');
-  rows.prepend(tr);
-  while (rows.children.length > 50) rows.removeChild(rows.lastChild);
-}}
-
-function render(e) {{
-  // Accept both older and newer event shapes.
-  const d = e.data || {{}};
-  const amber = (d.sources && d.sources.amber) || {{}};
-  const alpha = (d.sources && d.sources.alpha) || {{}};
-  const gw = (d.sources && d.sources.goodwe) || {{}};
-
-  // decision may exist nested (preferred), otherwise fall back to top-level.
-  const dec = d.decision || {{
-    export_costs: Boolean(e.export_costs),
-    want_pct: e.want_pct,
-    want_enabled: e.want_enabled,
-    reason: e.reason,
-    target_w: undefined
-  }};
-
-  const act = d.actuation || {{}};
-
-  $('export_costs').innerHTML = dec.export_costs ? pill(false, 'true (costs)') : pill(true, 'false (ok)');
-  $('want_limit').textContent = fmt(dec.want_pct, '%') + (dec.target_w ? (' (~' + fmt(dec.target_w, 'W') + ')') : '');
-  $('want_enabled').textContent = fmt(dec.want_enabled);
-  $('reason').textContent = fmt(dec.reason);
-  $('write').textContent = act.write_attempted ? (act.write_ok ? 'ok' : ('failed: ' + fmt(act.write_error))) : 'not attempted';
-
-  $('amber_feedin').textContent = fmt(amber.feedin_c, 'c');
-  $('amber_import').textContent = fmt(amber.import_c, 'c');
-  $('amber_age').textContent = fmt(amber.age_s, 's');
-  $('amber_end').textContent = fmt(amber.interval_end_utc);
-
-  $('alpha_soc').textContent = fmt(alpha.soc_pct, '%');
-  $('alpha_pload').textContent = fmt(alpha.pload_w, 'W');
-  $('alpha_pbat').textContent = fmt(alpha.pbat_w, 'W');
-  $('alpha_pgrid').textContent = fmt(alpha.pgrid_w, 'W');
-  $('alpha_age').textContent = fmt(alpha.age_s, 's');
-
-  $('gw_gen').textContent = fmt(gw.gen_w, 'W');
-  $('gw_feed').textContent = fmt(gw.feed_w, 'W');
-  $('gw_temp').textContent = fmt(gw.temp_c, 'C');
-  $('gw_meter').textContent = fmt(gw.meter_ok);
-  $('gw_wifi').textContent = fmt(gw.wifi_pct, '%');
-
-  appendLog(`[${{e.ts_local}}] feedIn=${{fmt(amber.feedin_c,'c')}} export_costs=${{dec.export_costs}} want=${{fmt(dec.want_pct,'%')}} enabled=${{dec.want_enabled}} reason=${{(dec.reason||'').toString()}}`);
-  addRow(e);
-}}
-
-async function init() {{
-  const baseLabel = API_BASE && API_BASE.length ? API_BASE : window.location.origin;
-  $('status').textContent = `API ${{MODE}}: ${{baseLabel}}`;
-
-  try {{
-    const r = await fetch(`${{API_BASE}}/api/events/latest`, {{ cache: 'no-store' }});
-    if (!r.ok) {{
-      showError(`GET /api/events/latest failed: ${{r.status}} ${{r.statusText}}`);
-      return;
-    }}
-    const e = await r.json();
-    lastId = e.id || 0;
-    try {{
-      render(e);
-    }} catch (err) {{
-      showError(`render(latest) failed: ${{err && err.stack ? err.stack : err}}`);
-      return;
-    }}
-  }} catch (e) {{
-    showError(`fetch(latest) threw: ${{String(e)}}`);
-    $('status').textContent = `API unreachable ${{MODE}}: ${{baseLabel}}`;
-    return;
+  function showError(msg) {{
+    var box = $('errorBox');
+    var pre = $('errorText');
+    box.style.display = 'block';
+    pre.textContent = msg;
   }}
 
-  const esUrl = `${{API_BASE}}/api/sse/events?after_id=${{lastId}}`;
-  appendLog(`connecting SSE: ${{esUrl}}`);
-  const es = new EventSource(esUrl);
+  // mark that the script loaded at all
+  try {{
+    $('status').textContent = 'script loaded (' + MODE + ')';
+  }} catch (e) {{
+    // ignore
+  }}
 
-  es.addEventListener('event', (msg) => {{
-    try {{
-      const e = JSON.parse(msg.data);
-      lastId = Math.max(lastId, e.id || 0);
-      render(e);
-      $('status').textContent = `connected ${{MODE}} (last id: ${{lastId}})`;
-    }} catch (err) {{
-      showError(`SSE message parse/render error: ${{err && err.stack ? err.stack : err}}\nraw: ${{msg.data}}`);
-    }}
+  window.addEventListener('error', function(e) {{
+    showError('error: ' + e.message + '\n' + e.filename + ':' + e.lineno + ':' + e.colno);
   }});
 
-  es.onerror = () => {{
-    $('status').textContent = `disconnected ${{MODE}} — retrying…`;
-  }};
-}}
+  window.addEventListener('unhandledrejection', function(e) {{
+    showError('unhandledrejection: ' + String(e.reason));
+  }});
 
-init();
+  function pill(ok, text) {{
+    var cls = (ok === true) ? 'pill ok' : ((ok === false) ? 'pill bad' : 'pill warn');
+    return '<span class="' + cls + '">' + text + '</span>';
+  }}
+
+  function fmt(x, suffix) {{
+    if (suffix === undefined) suffix = '';
+    if (x === null || x === undefined) return '—';
+    return String(x) + suffix;
+  }}
+
+  function appendLog(line) {{
+    var el = $('log');
+    el.textContent += line;
+    el.textContent += String.fromCharCode(10);
+    el.scrollTop = el.scrollHeight;
+  }}
+
+  function addRow(e) {{
+    var d = e.data || {{}};
+    var amber = (d.sources && d.sources.amber) ? d.sources.amber : {{}};
+    var dec = d.decision || {{}};
+
+    var tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td>' + e.id + '</td>' +
+      '<td>' + fmt(e.ts_local) + '</td>' +
+      '<td>' + fmt(amber.feedin_c, 'c') + '</td>' +
+      '<td>' + String(dec.export_costs) + '</td>' +
+      '<td>' + fmt(dec.want_pct, '%') + '</td>' +
+      '<td>' + String((dec.reason || '')).slice(0, 80) + '</td>';
+
+    var rows = $('rows');
+    rows.prepend(tr);
+    while (rows.children.length > 50) rows.removeChild(rows.lastChild);
+  }}
+
+  function render(e) {{
+    var d = e.data || {{}};
+
+    var amber = (d.sources && d.sources.amber) ? d.sources.amber : {{}};
+    var alpha = (d.sources && d.sources.alpha) ? d.sources.alpha : {{}};
+    var gw = (d.sources && d.sources.goodwe) ? d.sources.goodwe : {{}};
+
+    var dec = d.decision || {{
+      export_costs: Boolean(e.export_costs),
+      want_pct: e.want_pct,
+      want_enabled: e.want_enabled,
+      reason: e.reason,
+      target_w: undefined
+    }};
+
+    var act = d.actuation || {{}};
+
+    $('export_costs').innerHTML = dec.export_costs ? pill(false, 'true (costs)') : pill(true, 'false (ok)');
+    $('want_limit').textContent = fmt(dec.want_pct, '%') + (dec.target_w ? (' (~' + fmt(dec.target_w, 'W') + ')') : '');
+    $('want_enabled').textContent = fmt(dec.want_enabled);
+    $('reason').textContent = fmt(dec.reason);
+    $('write').textContent = act.write_attempted ? (act.write_ok ? 'ok' : ('failed: ' + fmt(act.write_error))) : 'not attempted';
+
+    $('amber_feedin').textContent = fmt(amber.feedin_c, 'c');
+    $('amber_import').textContent = fmt(amber.import_c, 'c');
+    $('amber_age').textContent = fmt(amber.age_s, 's');
+    $('amber_end').textContent = fmt(amber.interval_end_utc);
+
+    $('alpha_soc').textContent = fmt(alpha.soc_pct, '%');
+    $('alpha_pload').textContent = fmt(alpha.pload_w, 'W');
+    $('alpha_pbat').textContent = fmt(alpha.pbat_w, 'W');
+    $('alpha_pgrid').textContent = fmt(alpha.pgrid_w, 'W');
+    $('alpha_age').textContent = fmt(alpha.age_s, 's');
+
+    $('gw_gen').textContent = fmt(gw.gen_w, 'W');
+    $('gw_feed').textContent = fmt(gw.feed_w, 'W');
+    $('gw_temp').textContent = fmt(gw.temp_c, 'C');
+    $('gw_meter').textContent = fmt(gw.meter_ok);
+    $('gw_wifi').textContent = fmt(gw.wifi_pct, '%');
+
+    appendLog('[' + e.ts_local + '] feedIn=' + fmt(amber.feedin_c,'c') +
+              ' export_costs=' + String(dec.export_costs) +
+              ' want=' + fmt(dec.want_pct,'%') +
+              ' enabled=' + fmt(dec.want_enabled) +
+              ' reason=' + String(dec.reason || ''));
+
+    addRow(e);
+  }}
+
+  function httpGetJson(url, onOk, onErr) {{
+    try {{
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      xhr.setRequestHeader('Cache-Control', 'no-store');
+      xhr.onreadystatechange = function() {{
+        if (xhr.readyState !== 4) return;
+        if (xhr.status >= 200 && xhr.status < 300) {{
+          try {{
+            onOk(JSON.parse(xhr.responseText));
+          }} catch (e) {{
+            onErr('JSON parse failed: ' + e);
+          }}
+        }} else {{
+          onErr('HTTP ' + xhr.status + ' ' + xhr.statusText + ' body=' + xhr.responseText);
+        }}
+      }};
+      xhr.send(null);
+    }} catch (e) {{
+      onErr('XHR failed: ' + e);
+    }}
+  }}
+
+  function init() {{
+    var baseLabel = (API_BASE && API_BASE.length) ? API_BASE : window.location.origin;
+    $('status').textContent = 'API ' + MODE + ': ' + baseLabel;
+
+    httpGetJson((API_BASE || '') + '/api/events/latest',
+      function(e) {{
+        try {{
+          window.__lastId = e.id || 0;
+          render(e);
+        }} catch (err) {{
+          showError('render(latest) failed: ' + (err && err.stack ? err.stack : err));
+          return;
+        }}
+
+        // SSE connect after initial render
+        try {{
+          var esUrl = (API_BASE || '') + '/api/sse/events?after_id=' + window.__lastId;
+          appendLog('connecting SSE: ' + esUrl);
+          var es = new EventSource(esUrl);
+
+          es.addEventListener('event', function(msg) {{
+            try {{
+              var ev = JSON.parse(msg.data);
+              window.__lastId = Math.max(window.__lastId, ev.id || 0);
+              render(ev);
+              $('status').textContent = 'connected ' + MODE + ' (last id: ' + window.__lastId + ')';
+            }} catch (err) {{
+              showError('SSE parse/render error: ' + (err && err.stack ? err.stack : err) + '\nraw: ' + msg.data);
+            }}
+          }});
+
+          es.onerror = function() {{
+            $('status').textContent = 'disconnected ' + MODE + ' - retrying...';
+          }};
+        }} catch (e) {{
+          showError('EventSource failed: ' + e);
+        }}
+      }},
+      function(errmsg) {{
+        showError('GET /api/events/latest failed: ' + errmsg);
+        $('status').textContent = 'API unreachable ' + MODE + ': ' + baseLabel;
+      }}
+    );
+  }}
+
+  try {{
+    init();
+  }} catch (e) {{
+    showError('init threw: ' + (e && e.stack ? e.stack : e));
+  }}
 </script>
 </body>
 </html>"""
