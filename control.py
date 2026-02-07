@@ -17,6 +17,8 @@ from pathlib import Path
 
 import requests
 
+from logging_setup import setup_logging
+
 try:
     from pymodbus.client import ModbusTcpClient
 except Exception:
@@ -222,6 +224,9 @@ DEBUG = _env_bool("DEBUG", False)
 # Event export
 EVENT_EXPORT_ENABLED = _env_bool("EVENT_EXPORT_ENABLED", True)
 EVENT_EXPORT_DIR = _env("EVENT_EXPORT_DIR", "export/events")
+
+# Logging: rotating file + optional stdout
+LOG = setup_logging("control", debug_default=DEBUG)
 
 
 # Reduce noisy pymodbus console output unless DEBUG is enabled.
@@ -707,15 +712,15 @@ class GoodWeModbus:
         backoff = max(float(self.reconnect_min_backoff_sec), backoff)
         backoff = min(float(self.reconnect_max_backoff_sec), backoff)
 
-        print(f"  [goodwe] modbus reconnecting ({self.host}:{self.port}) after {where}: {exc}")
+        LOG.warning(f"  [goodwe] modbus reconnecting ({self.host}:{self.port}) after {where}: {exc}")
 
         if self.connect():
-            print(f"  [goodwe] modbus reconnected ({self.host}:{self.port})")
+            LOG.info(f"  [goodwe] modbus reconnected ({self.host}:{self.port})")
             return
 
         self._reconnect_failures = failures + 1
         self._next_reconnect_ts = now + backoff
-        print(f"  [goodwe] modbus reconnect failed; next retry in {backoff:.1f}s")
+        LOG.warning(f"  [goodwe] modbus reconnect failed; next retry in {backoff:.1f}s")
 
     def _read_holding(self, address: int, count: int) -> List[int]:
         if not self.client:
@@ -751,7 +756,7 @@ class GoodWeModbus:
                     rr = fn(*a, **kw)
                     if DEBUG:
                         used = "positional" if not kw else ",".join(sorted(kw.keys()))
-                        print(f"  [pymodbus] read_holding_registers compat used: {used} addr={address} count={count} unit={uid}")
+                        LOG.debug(f"  [pymodbus] read_holding_registers compat used: {used} addr={address} count={count} unit={uid}")
                     return rr
                 except TypeError as e:
                     last_te = e
@@ -816,7 +821,7 @@ class GoodWeModbus:
                     rr = fn(*a, **kw)
                     if DEBUG:
                         used = "positional" if not kw else ",".join(sorted(kw.keys()))
-                        print(f"  [pymodbus] read_input_registers compat used: {used} addr={address} count={count} unit={uid}")
+                        LOG.debug(f"  [pymodbus] read_input_registers compat used: {used} addr={address} count={count} unit={uid}")
                     return rr
                 except TypeError as e:
                     last_te = e
@@ -882,7 +887,7 @@ class GoodWeModbus:
                     rr = fn(*a, **kw)
                     if DEBUG:
                         used = "positional" if not kw else ",".join(sorted(kw.keys()))
-                        print(f"  [pymodbus] write_register compat used: {used} addr={address} value={v} unit={uid}")
+                        LOG.debug(f"  [pymodbus] write_register compat used: {used} addr={address} value={v} unit={uid}")
                     return rr
                 except TypeError as e:
                     last_te = e
@@ -1640,29 +1645,29 @@ class AlphaEssOpenApiPoller:
 
 def main() -> int:
     if AMBER_SITE_ID == "..." or AMBER_API_KEY == "...":
-        print("[error] missing AMBER_SITE_ID and/or AMBER_API_KEY")
+        LOG.error("[error] missing AMBER_SITE_ID and/or AMBER_API_KEY")
         return 2
 
-    print(
+    LOG.info(
         f"[start] amber_site_id={AMBER_SITE_ID} goodwe={GOODWE_HOST} unit={GOODWE_UNIT} "
         f"timeout={MODBUS_TIMEOUT_SEC:.1f}s retries={MODBUS_RETRIES} "
         f"reconnect={'on' if MODBUS_RECONNECT_ON_ERROR else 'off'} "
         f"backoff={MODBUS_RECONNECT_MIN_BACKOFF_SEC:.1f}-{MODBUS_RECONNECT_MAX_BACKOFF_SEC:.1f}s"
     )
-    print(
+    LOG.info(
         f"[start] limit_mode={GOODWE_EXPORT_LIMIT_MODE} export_switch_reg={GOODWE_EXPORT_SWITCH_REG} "
         f"export_pct_reg={GOODWE_EXPORT_PCT_REG} export_pct10_reg={GOODWE_EXPORT_PCT10_REG} "
         f"active_pct_reg={GOODWE_ACTIVE_PCT_REG} rated={GOODWE_RATED_W}W "
         f"always_enabled={GOODWE_ALWAYS_ENABLED} threshold={EXPORT_COST_THRESHOLD_C}c"
     )
-    print(f"[start] runtime_profile={RUNTIME_PROFILE} (auto tries dns then mt)")
-    print(
+    LOG.info(f"[start] runtime_profile={RUNTIME_PROFILE} (auto tries dns then mt)")
+    LOG.info(
         f"[start] amber_api_key={'set' if (AMBER_API_KEY and AMBER_API_KEY != '...') else 'missing'} "
         f"amber_res={AMBER_RESOLUTION_MIN}m amber_fetch_usage={AMBER_FETCH_USAGE} "
         f"alphaess_openapi_enabled={ALPHAESS_OPENAPI_ENABLED} "
         f"alphaess_keys={'set' if (ALPHAESS_APP_ID and ALPHAESS_APP_SECRET and ALPHAESS_APP_ID != '...') else 'missing'}"
     )
-    print(
+    LOG.info(
         f"[start] alphaess_idle_threshold={ALPHAESS_PBAT_IDLE_THRESHOLD_W}W "
         f"auto_charge_below_soc={ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT}% "
         f"auto_charge_w={ALPHAESS_AUTO_CHARGE_W}W auto_charge_max_w={ALPHAESS_AUTO_CHARGE_MAX_W}W "
@@ -1689,7 +1694,7 @@ def main() -> int:
     )
 
     if not modbus.connect():
-        print("[error] failed to connect to GoodWe Modbus TCP")
+        LOG.error("[error] failed to connect to GoodWe Modbus TCP")
         try:
             amber_poller.close()
         except Exception:
@@ -1722,7 +1727,7 @@ def main() -> int:
                 verify_ssl=ALPHAESS_VERIFY_SSL,
             )
         except Exception as e:
-            print(f"[error] alphaess init failed: {e}")
+            LOG.error(f"[error] alphaess init failed: {e}")
             try:
                 amber_poller.close()
             except Exception:
@@ -1930,8 +1935,8 @@ def main() -> int:
 
                 current_limit = limiter.read_current()
 
-                print(
-                    f"[{_iso_now()}] import={_fmt_opt(import_c,'c')} feedIn={_fmt_opt(feed_c,'c')} "
+                LOG.info(
+                    f"import={_fmt_opt(import_c,'c')} feedIn={_fmt_opt(feed_c,'c')} "
                     f"thresh={EXPORT_COST_THRESHOLD_C}c export_costs={export_costs} {amber_desc} "
                     f"gen={_fmt_opt(gen_w,'W')} pv_est={_fmt_opt(pv_est_w,'W')} feed={_fmt_opt(feed_w,'W')} "
                     f"pwrLimitFn={_fmt_opt(pwr_limit_fn)} meterOK={_fmt_opt(meter_ok)} wifi={_fmt_opt(wifi,'%')} temp={_fmt_opt(temp_c,'C')} "
@@ -1963,9 +1968,9 @@ def main() -> int:
                         write_ok = True
                     except Exception as e:
                         write_error = str(e)
-                        print(f"  [goodwe] write failed: {e}")
+                        LOG.error(f"  [goodwe] write failed: {e}")
                 elif not can_write and DEBUG:
-                    print("  [goodwe] skipping write (rate limited)")
+                    LOG.debug("  [goodwe] skipping write (rate limited)")
 
                 # ---- Export structured decision event (best effort) ----
                 try:
@@ -2043,7 +2048,7 @@ def main() -> int:
                     pass
 
             except Exception as e:
-                print(f"[error] {e}")
+                LOG.error(f"[error] {e}")
 
             time.sleep(float(SLEEP_SECONDS))
 

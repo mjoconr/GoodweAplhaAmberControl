@@ -10,6 +10,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
+import logging
+
+from logging_setup import setup_logging
+
 
 def _env(name: str, default: str = "") -> str:
     v = os.getenv(name)
@@ -41,6 +45,11 @@ def _env_bool(name: str, default: bool) -> bool:
     if v is None or v == "":
         return default
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+# Logging
+DEBUG = _env_bool("DEBUG", False)
+LOG = setup_logging("ingest", debug_default=DEBUG)
+
 
 
 def _wal_path(db_path: Path) -> Path:
@@ -212,7 +221,7 @@ def main() -> int:
     truncate_mb = _env_int("INGEST_WAL_TRUNCATE_MB", 16)
     last_ckpt = time.monotonic()
 
-    print(
+    LOG.info(
         f"[ingest] export_dir={export_dir} processed_dir={processed_dir} db={db_path} "
         f"delete={bool(args.delete)} ckpt={ckpt_every}s truncate_mb={truncate_mb}"
     )
@@ -262,7 +271,7 @@ def main() -> int:
             time.sleep(max(0.1, float(args.poll)))
 
     except KeyboardInterrupt:
-        print("[ingest] stopping")
+        LOG.info("[ingest] stopping")
         return 0
     finally:
         try:

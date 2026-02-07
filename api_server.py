@@ -7,6 +7,8 @@ import sqlite3
 import time
 from typing import Any, Dict, Generator, Optional
 
+from logging_setup import setup_logging
+
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -228,7 +230,11 @@ def sse_events(after_id: int = Query(0, ge=0)) -> StreamingResponse:
 if __name__ == "__main__":
     import uvicorn
 
+    # Rotating file logs (LOG_DIR/api.log) + optional stdout
+    debug_default = _env("DEBUG", "").strip().lower() in ("1", "true", "yes", "y", "on")
+    setup_logging("api", debug_default=debug_default)
+
     host = _env("API_HOST", "127.0.0.1")
     port = _env_int("API_PORT", 8001)
 
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    uvicorn.run(app, host=host, port=port, log_level="info", log_config=None)

@@ -197,6 +197,18 @@ Set:
 
 * `DEBUG=1`
 
+### Log files + rotation
+
+By default, each process writes a rotating log file into `./logs/` (e.g. `logs/control.log`) and also logs to stdout. Rotation is size-based so logs don’t grow unbounded.
+
+Settings (all optional):
+
+* `LOG_DIR` (default `logs`)
+* `LOG_MAX_BYTES` (default 5242880 = 5MB)
+* `LOG_BACKUP_COUNT` (default 5)
+* `LOG_TO_STDOUT` (default 1)
+* `LOG_LEVEL` (default `INFO`, or `DEBUG` when `DEBUG=1`)
+
 ---
 
 ## Safety note
