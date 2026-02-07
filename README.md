@@ -294,3 +294,39 @@ sudo systemctl enable --now goodwe-stack.target
 - the `.env` file location
 
 ```
+
+---
+
+## Controlling log + SQLite growth
+
+### Raw payloads in events
+
+Each control-loop iteration writes an event JSON record. Some upstream fields can be very large:
+
+- `sources.amber.raw_prices` / `sources.amber.raw_usage`
+- `sources.alpha.raw`
+
+To avoid storing these large payloads on every loop, configure:
+
+- `EVENT_EXPORT_AMBER_RAW_MODE` = `always` | `on_change` | `never`
+- `EVENT_EXPORT_ALPHA_RAW_MODE` = `always` | `on_change` | `never`
+
+Recommended defaults are `on_change` for both.
+
+### SQLite retention
+
+`ingest_to_sqlite.py` can automatically slim and/or delete old rows:
+
+- `INGEST_RETENTION_FULL_HOURS` (default 48): events older than this will have the large raw payload fields removed (but key telemetry + decision fields remain)
+- `INGEST_RETENTION_DELETE_AFTER_DAYS` (default 30): delete very old events entirely (set 0 to disable)
+
+Note: deleting/slimming rows reduces future growth, but the SQLite file may not shrink until you run **VACUUM**.
+
+### VACUUM
+
+To compact the DB file:
+
+```bash
+set -a; source .env; set +a
+python3 ingest_to_sqlite.py --vacuum
+```

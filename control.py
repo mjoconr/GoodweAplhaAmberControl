@@ -101,6 +101,14 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+
+def _env_choice(name: str, default: str, allowed: Tuple[str, ...]) -> str:
+    v = _env(name, default).strip().lower()
+    if v in allowed:
+        return v
+    return str(default).strip().lower()
+
+
 def _iso_now() -> str:
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -224,6 +232,17 @@ DEBUG = _env_bool("DEBUG", False)
 # Event export
 EVENT_EXPORT_ENABLED = _env_bool("EVENT_EXPORT_ENABLED", True)
 EVENT_EXPORT_DIR = _env("EVENT_EXPORT_DIR", "export/events")
+EVENT_EXPORT_AMBER_RAW_MODE = _env_choice(
+    "EVENT_EXPORT_AMBER_RAW_MODE",
+    "on_change",
+    ("never", "on_change", "always"),
+)
+EVENT_EXPORT_ALPHA_RAW_MODE = _env_choice(
+    "EVENT_EXPORT_ALPHA_RAW_MODE",
+    "on_change",
+    ("never", "on_change", "always"),
+)
+
 
 # Logging: rotating file + optional stdout
 LOG = setup_logging("control", debug_default=DEBUG)
@@ -1667,6 +1686,10 @@ def main() -> int:
         f"alphaess_openapi_enabled={ALPHAESS_OPENAPI_ENABLED} "
         f"alphaess_keys={'set' if (ALPHAESS_APP_ID and ALPHAESS_APP_SECRET and ALPHAESS_APP_ID != '...') else 'missing'}"
     )
+
+    LOG.info(
+        f"[start] event_raw_modes amber={EVENT_EXPORT_AMBER_RAW_MODE} alpha={EVENT_EXPORT_ALPHA_RAW_MODE}"
+    )
     LOG.info(
         f"[start] alphaess_idle_threshold={ALPHAESS_PBAT_IDLE_THRESHOLD_W}W "
         f"auto_charge_below_soc={ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT}% "
@@ -1743,6 +1766,10 @@ def main() -> int:
     last_limit_state: Optional[Tuple[int, int]] = None  # (enabled, pct)
     last_write_ts = 0.0
     loop_counter = 0
+
+    last_amber_interval_end_iso: Optional[str] = None
+    last_alpha_sig: Optional[Tuple[Any, ...]] = None
+
 
     try:
         while True:
@@ -1977,6 +2004,92 @@ def main() -> int:
                     ts_utc = _utc_iso_z(now)
                     ts_local = datetime.fromtimestamp(now, tz=timezone.utc).astimezone().isoformat()
 
+
+                    # Optionally include large upstream "raw" payloads.
+
+                    # Keeping them in every loop iteration explodes SQLite size, so default is on_change.
+
+                    amber_raw_prices = None
+
+                    amber_raw_usage = None
+
+                    if amber_snap is not None:
+
+                        try:
+
+                            cur_end = amber_snap.interval_end_utc.isoformat() if amber_snap.interval_end_utc else None
+
+                        except Exception:
+
+                            cur_end = None
+
+                        if EVENT_EXPORT_AMBER_RAW_MODE == "always":
+
+                            amber_raw_prices = amber_snap.raw_prices
+
+                            amber_raw_usage = amber_snap.raw_usage
+
+                        elif EVENT_EXPORT_AMBER_RAW_MODE == "on_change":
+
+                            if cur_end is not None and cur_end != last_amber_interval_end_iso:
+
+                                amber_raw_prices = amber_snap.raw_prices
+
+                                amber_raw_usage = amber_snap.raw_usage
+
+                                last_amber_interval_end_iso = cur_end
+
+                        else:
+
+                            # never
+
+                            pass
+
+
+                    alpha_raw = None
+
+                    if alpha_snap is not None:
+
+                        if EVENT_EXPORT_ALPHA_RAW_MODE == "always":
+
+                            alpha_raw = alpha_snap.raw
+
+                        elif EVENT_EXPORT_ALPHA_RAW_MODE == "on_change":
+
+                            sig = (
+
+                                alpha_snap.sys_sn,
+
+                                alpha_snap.soc_pct,
+
+                                alpha_snap.batt_state,
+
+                                alpha_snap.pload_w,
+
+                                alpha_snap.pbat_w_raw,
+
+                                alpha_snap.pgrid_w_raw,
+
+                                alpha_snap.ppv_w,
+
+                                alpha_snap.pev_w,
+
+                            )
+
+                            if sig != last_alpha_sig:
+
+                                alpha_raw = alpha_snap.raw
+
+                                last_alpha_sig = sig
+
+                        else:
+
+                            # never
+
+                            pass
+
+
+
                     event: Dict[str, Any] = {
                         'schema': 1,
                         'event_id': str(uuid.uuid4()),
@@ -1995,8 +2108,8 @@ def main() -> int:
                                 'feedin_c': feed_c,
                                 'import_power_w': amber_import_w,
                                 'feedin_power_w': amber_feed_w,
-                                'raw_prices': amber_snap.raw_prices if amber_snap else None,
-                                'raw_usage': amber_snap.raw_usage if amber_snap else None,
+                                'raw_prices': amber_raw_prices,
+                                'raw_usage': amber_raw_usage,
                                 'error': amber_err,
                             },
                             'goodwe': {
@@ -2022,7 +2135,7 @@ def main() -> int:
                                 'pgrid_w': alpha_snap.pgrid_w if alpha_snap else None,
                                 'charge_w': alpha_snap.charge_w if alpha_snap else None,
                                 'discharge_w': alpha_snap.discharge_w if alpha_snap else None,
-                                'raw': alpha_snap.raw if alpha_snap else None,
+                                'raw': alpha_raw,
                                 'error': alpha_poller.get_last_error() if alpha_poller else None,
                             },
                         },
