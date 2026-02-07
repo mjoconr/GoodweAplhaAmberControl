@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-from contextlib import asynccontextmanager
 from typing import Dict, Iterable
 
 from fastapi import FastAPI, Request
@@ -38,8 +37,9 @@ API_UPSTREAM = _env("UI_API_UPSTREAM", _env("UI_API_BASE", "http://127.0.0.1:800
 # This avoids the common pitfall where the browser tries to connect to 127.0.0.1 (its own machine).
 UI_PROXY_API = _env_bool("UI_PROXY_API", "1")
 
+app = FastAPI(title="GoodWe Control UI")
 
-_httpx_client = None  # created lazily
+_httpx_client = None  # created lazily on first request
 
 
 def _hop_by_hop_headers() -> set:
@@ -78,24 +78,14 @@ async def _get_httpx():
     return _httpx_client
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # startup: nothing
-    yield
-    # shutdown: close httpx client
+@app.on_event("shutdown")
+async def _shutdown_httpx() -> None:
     global _httpx_client
     if _httpx_client is not None:
         try:
             await _httpx_client.aclose()
         finally:
             _httpx_client = None
-
-
-app = FastAPI(title="GoodWe Control UI", lifespan=lifespan)
-
-# -------------------------
-# Reverse proxy (optional)
-# -------------------------
 
 
 @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])  # type: ignore[misc]
@@ -106,7 +96,6 @@ async def proxy_api(path: str, request: Request) -> Response:
 
     Disable with UI_PROXY_API=0 if you want the browser to connect directly to api_server.
     """
-
     if not UI_PROXY_API:
         return Response(status_code=404, content=b"UI_PROXY_API disabled")
 
@@ -115,69 +104,58 @@ async def proxy_api(path: str, request: Request) -> Response:
 
     client = await _get_httpx()
 
-    # Forward query params and body.
     body = await request.body()
     headers = _filter_headers(request.headers.items())
+    params = dict(request.query_params)
 
-    # Decide if we must stream (SSE endpoint or Accept: text/event-stream).
-    accept = request.headers.get("accept", "").lower()
-    want_stream = path.startswith("sse/") or "text/event-stream" in accept
+    # Decide whether to stream (SSE) or buffer.
+    accept = (request.headers.get("accept") or "").lower()
+    want_stream = path.startswith("sse/") or ("text/event-stream" in accept)
 
     try:
-        if want_stream:
-            # Use stream=True so we can relay SSE without buffering and without closing the upstream early.
-            req = client.build_request(
-                request.method,
-                url,
-                params=dict(request.query_params),
-                headers=headers,
-                content=body if body else None,
-            )
-            resp = await client.send(req, stream=True)
-
-            resp_headers = _filter_headers(resp.headers.items())
-            resp_headers.pop("content-length", None)
-
-            media_type = resp.headers.get("content-type")
-
-            async def _iter():
-                try:
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
-                finally:
-                    await resp.aclose()
-
-            return StreamingResponse(
-                _iter(),
-                status_code=resp.status_code,
-                headers=resp_headers,
-                media_type=media_type,
-            )
-
-        # Non-streaming: buffer response content.
-        resp = await client.request(
+        req = client.build_request(
             request.method,
             url,
-            params=dict(request.query_params),
-            headers=headers,
+            params=params,
             content=body if body else None,
+            headers=headers,
         )
+
+        if not want_stream:
+            resp = await client.send(req, stream=False)
+            resp_headers = _filter_headers(resp.headers.items())
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers=resp_headers,
+                media_type=resp.headers.get("content-type"),
+            )
+
+        # Streaming path (SSE)
+        resp = await client.send(req, stream=True)
         resp_headers = _filter_headers(resp.headers.items())
-        content = resp.content
-        media_type = resp.headers.get("content-type")
-        return Response(
-            content=content,
+
+        # Ensure SSE-friendly headers even when proxied.
+        resp_headers.pop("content-length", None)
+        resp_headers.setdefault("cache-control", "no-cache")
+        resp_headers.setdefault("x-accel-buffering", "no")
+
+        async def gen():
+            try:
+                async for chunk in resp.aiter_bytes():
+                    if chunk:
+                        yield chunk
+            finally:
+                await resp.aclose()
+
+        return StreamingResponse(
+            gen(),
             status_code=resp.status_code,
             headers=resp_headers,
-            media_type=media_type,
+            media_type=resp.headers.get("content-type"),
         )
     except Exception as e:
         return Response(status_code=502, content=f"Upstream API error: {e}".encode("utf-8"))
-
-
-# -------------------------
-# UI page
-# -------------------------
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -187,13 +165,14 @@ def index() -> str:
     api_base_for_browser = "" if UI_PROXY_API else _env("UI_API_BASE", "")
     api_base_js = json.dumps(api_base_for_browser)
 
-    proxy_banner = "(proxied)" if UI_PROXY_API else "(direct)"
+    proxy_banner = "proxied" if UI_PROXY_API else "direct"
+    proxy_banner_js = json.dumps(proxy_banner)
 
     return f"""<!doctype html>
-<html lang=\"en\">
+<html lang="en">
 <head>
-  <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>GoodWe Control — Live</title>
   <style>
     body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #0b0f14; color: #e6edf3; }}
@@ -215,66 +194,73 @@ def index() -> str:
     th, td {{ border-bottom: 1px solid #202938; padding: 6px 8px; text-align: left; }}
     th {{ opacity: 0.8; font-weight: 600; }}
     .muted {{ opacity: 0.7; }}
+    .err {{ border-color: rgba(248, 81, 73, 0.55); background: rgba(248, 81, 73, 0.08); }}
+    .err pre {{ margin: 0; white-space: pre-wrap; word-break: break-word; }}
   </style>
 </head>
 <body>
   <header>
     <h1>GoodWe Control — Live</h1>
-    <div class=\"status\" id=\"status\">connecting…</div>
+    <div class="status" id="status">connecting…</div>
   </header>
 
   <main>
-    <div class=\"grid\">
-      <div class=\"card\">
+    <div class="card err" id="errorBox" style="display:none;">
+      <h2>UI error</h2>
+      <pre id="errorText"></pre>
+    </div>
+
+    <div class="grid">
+      <div class="card">
         <h2>Decision</h2>
-        <div class=\"kv\">
-          <div>export_costs</div><div id=\"export_costs\" class=\"muted\">—</div>
-          <div>want_limit</div><div id=\"want_limit\" class=\"muted\">—</div>
-          <div>want_enabled</div><div id=\"want_enabled\" class=\"muted\">—</div>
-          <div>reason</div><div id=\"reason\" class=\"muted\">—</div>
-          <div>write</div><div id=\"write\" class=\"muted\">—</div>
+        <div class="kv">
+          <div>export_costs</div><div id="export_costs" class="muted">—</div>
+          <div>want_limit</div><div id="want_limit" class="muted">—</div>
+          <div>want_enabled</div><div id="want_enabled" class="muted">—</div>
+          <div>reason</div><div id="reason" class="muted">—</div>
+          <div>write</div><div id="write" class="muted">—</div>
         </div>
       </div>
 
-      <div class=\"card\">
+      <div class="card">
         <h2>Amber</h2>
-        <div class=\"kv\">
-          <div>feedIn</div><div id=\"amber_feedin\" class=\"muted\">—</div>
-          <div>import</div><div id=\"amber_import\" class=\"muted\">—</div>
-          <div>age</div><div id=\"amber_age\" class=\"muted\">—</div>
-          <div>interval_end</div><div id=\"amber_end\" class=\"muted\">—</div>
+        <div class="kv">
+          <div>feedIn</div><div id="amber_feedin" class="muted">—</div>
+          <div>import</div><div id="amber_import" class="muted">—</div>
+          <div>age</div><div id="amber_age" class="muted">—</div>
+          <div>interval_end</div><div id="amber_end" class="muted">—</div>
         </div>
       </div>
 
-      <div class=\"card\">
+      <div class="card">
         <h2>AlphaESS</h2>
-        <div class=\"kv\">
-          <div>SOC</div><div id=\"alpha_soc\" class=\"muted\">—</div>
-          <div>pload</div><div id=\"alpha_pload\" class=\"muted\">—</div>
-          <div>pbat</div><div id=\"alpha_pbat\" class=\"muted\">—</div>
-          <div>pgrid</div><div id=\"alpha_pgrid\" class=\"muted\">—</div>
-          <div>age</div><div id=\"alpha_age\" class=\"muted\">—</div>
+        <div class="kv">
+          <div>SOC</div><div id="alpha_soc" class="muted">—</div>
+          <div>pload</div><div id="alpha_pload" class="muted">—</div>
+          <div>pbat</div><div id="alpha_pbat" class="muted">—</div>
+          <div>pgrid</div><div id="alpha_pgrid" class="muted">—</div>
+          <div>age</div><div id="alpha_age" class="muted">—</div>
         </div>
       </div>
 
-      <div class=\"card\">
+      <div class="card">
         <h2>GoodWe</h2>
-        <div class=\"kv\">
-          <div>gen</div><div id=\"gw_gen\" class=\"muted\">—</div>
-          <div>feed</div><div id=\"gw_feed\" class=\"muted\">—</div>
-          <div>temp</div><div id=\"gw_temp\" class=\"muted\">—</div>
-          <div>meterOK</div><div id=\"gw_meter\" class=\"muted\">—</div>
-          <div>wifi</div><div id=\"gw_wifi\" class=\"muted\">—</div>
+        <div class="kv">
+          <div>gen</div><div id="gw_gen" class="muted">—</div>
+          <div>feed</div><div id="gw_feed" class="muted">—</div>
+          <div>temp</div><div id="gw_temp" class="muted">—</div>
+          <div>meterOK</div><div id="gw_meter" class="muted">—</div>
+          <div>wifi</div><div id="gw_wifi" class="muted">—</div>
         </div>
       </div>
     </div>
 
-    <div class=\"card\">
+    <div class="card">
       <h2>Live stream</h2>
-      <div class=\"log\" id=\"log\"></div>
+      <div class="log" id="log"></div>
     </div>
 
-    <div class=\"card\">
+    <div class="card">
       <h2>Recent events</h2>
       <table>
         <thead>
@@ -287,16 +273,31 @@ def index() -> str:
             <th>reason</th>
           </tr>
         </thead>
-        <tbody id=\"rows\"></tbody>
+        <tbody id="rows"></tbody>
       </table>
     </div>
   </main>
 
 <script>
 const API_BASE = {api_base_js};
-const MODE = {json.dumps(proxy_banner)};
+const MODE = {proxy_banner_js};
 const $ = (id) => document.getElementById(id);
 let lastId = 0;
+
+function showError(msg) {{
+  const box = $('errorBox');
+  const pre = $('errorText');
+  box.style.display = 'block';
+  pre.textContent = msg;
+}}
+
+window.addEventListener('error', (e) => {{
+  showError(`error: ${{e.message}}\n${{e.filename}}:${{e.lineno}}:${{e.colno}}`);
+}});
+
+window.addEventListener('unhandledrejection', (e) => {{
+  showError(`unhandledrejection: ${{String(e.reason)}}`);
+}});
 
 function pill(ok, text) {{
   const cls = ok === true ? 'pill ok' : (ok === false ? 'pill bad' : 'pill warn');
@@ -333,15 +334,25 @@ function addRow(e) {{
 }}
 
 function render(e) {{
+  // Accept both older and newer event shapes.
   const d = e.data || {{}};
   const amber = d.sources?.amber || {{}};
   const alpha = d.sources?.alpha || {{}};
   const gw = d.sources?.goodwe || {{}};
-  const dec = d.decision || {{}};
+
+  // decision may exist nested (preferred), otherwise fall back to top-level.
+  const dec = d.decision || {{
+    export_costs: Boolean(e.export_costs),
+    want_pct: e.want_pct,
+    want_enabled: e.want_enabled,
+    reason: e.reason,
+    target_w: undefined
+  }};
+
   const act = d.actuation || {{}};
 
   $('export_costs').innerHTML = dec.export_costs ? pill(false, 'true (costs)') : pill(true, 'false (ok)');
-  $('want_limit').textContent = fmt(dec.want_pct, '%') + ' (~' + fmt(dec.target_w, 'W') + ')';
+  $('want_limit').textContent = fmt(dec.want_pct, '%') + (dec.target_w ? (' (~' + fmt(dec.target_w, 'W') + ')') : '');
   $('want_enabled').textContent = fmt(dec.want_enabled);
   $('reason').textContent = fmt(dec.reason);
   $('write').textContent = act.write_attempted ? (act.write_ok ? 'ok' : ('failed: ' + fmt(act.write_error))) : 'not attempted';
@@ -372,17 +383,29 @@ async function init() {{
   $('status').textContent = `API ${{MODE}}: ${{baseLabel}}`;
 
   try {{
-    const r = await fetch(`${{API_BASE}}/api/events/latest`);
-    if (r.ok) {{
-      const e = await r.json();
-      lastId = e.id || 0;
+    const r = await fetch(`${{API_BASE}}/api/events/latest`, {{ cache: 'no-store' }});
+    if (!r.ok) {{
+      showError(`GET /api/events/latest failed: ${{r.status}} ${{r.statusText}}`);
+      return;
+    }}
+    const e = await r.json();
+    lastId = e.id || 0;
+    try {{
       render(e);
+    }} catch (err) {{
+      showError(`render(latest) failed: ${{err && err.stack ? err.stack : err}}`);
+      return;
     }}
   }} catch (e) {{
+    showError(`fetch(latest) threw: ${{String(e)}}`);
     $('status').textContent = `API unreachable ${{MODE}}: ${{baseLabel}}`;
+    return;
   }}
 
-  const es = new EventSource(`${{API_BASE}}/api/sse/events?after_id=${{lastId}}`);
+  const esUrl = `${{API_BASE}}/api/sse/events?after_id=${{lastId}}`;
+  appendLog(`connecting SSE: ${{esUrl}}`);
+  const es = new EventSource(esUrl);
+
   es.addEventListener('event', (msg) => {{
     try {{
       const e = JSON.parse(msg.data);
@@ -390,9 +413,10 @@ async function init() {{
       render(e);
       $('status').textContent = `connected ${{MODE}} (last id: ${{lastId}})`;
     }} catch (err) {{
-      // ignore
+      showError(`SSE message parse/render error: ${{err && err.stack ? err.stack : err}}\nraw: ${{msg.data}}`);
     }}
   }});
+
   es.onerror = () => {{
     $('status').textContent = `disconnected ${{MODE}} — retrying…`;
   }};
