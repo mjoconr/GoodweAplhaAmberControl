@@ -294,6 +294,29 @@ set -a; source .env; set +a
 python3 ui_server.py
 ```
 
+
+
+### React UI offline (no CDN)
+
+The main UI (`/`) is a React page, but `ui_server.py` does **not** require a build step.
+
+By default, it tries to load React + ReactDOM from **local vendor files** first:
+
+- `ui_static/vendor/react.production.min.js`
+- `ui_static/vendor/react-dom.production.min.js`
+
+If those files are missing, it falls back to loading them from a public CDN.
+
+To run fully offline, copy those two files into `ui_static/vendor/` (you can download them once on any machine with internet access, then copy them to the Pi).
+
+The Classic UI at `/classic` never uses a CDN.
+
+If you **never** want the UI to reach out to the internet, set:
+
+- `UI_REACT_CDN_FALLBACK=0`
+
+With that setting, the React UI will only load from local vendor files; if they are missing you can still use `/classic`.
+
 Then open:
 
 - UI: `http://<pi-ip>:8000/`

@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from logging_setup import setup_logging
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse, RedirectResponse
 
 
 logger = logging.getLogger("ui")
@@ -72,6 +72,11 @@ UI_PROXY_API = _env_bool("UI_PROXY_API", "1")
 DB_PATH = _env("UI_DB_PATH", _env("API_DB_PATH", _env("INGEST_DB_PATH", "data/events.sqlite3")))
 UI_REFRESH_SEC_DEFAULT = _env_int("UI_REFRESH_SEC", 0)
 BUILD_ID = _env("UI_BUILD_ID", str(int(time.time())))
+UI_REACT_CDN_FALLBACK = _env_bool("UI_REACT_CDN_FALLBACK", "1")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "ui_static")
+VENDOR_DIR = os.path.join(STATIC_DIR, "vendor")
 
 app = FastAPI(title="GoodWe Control UI")
 _httpx_client = None  # created lazily on first request
@@ -358,7 +363,7 @@ _HTML_TEMPLATE = """<!doctype html>
       <div class="small">DB: __DB_PATH__</div>
       <div class="small">Mode: __MODE__</div>
       <div class="small">Refresh: __REFRESH_LABEL__</div>
-      <div class="small">Tip: For server-only refresh use <code>/?refresh=2</code> (or <code>/?UI_REFRESH_SEC=2</code>). For SSE live mode use <code>/</code> (no refresh).</div>
+      <div class="small">Tip: For server-only refresh use <code>/classic?refresh=2</code> (or <code>/classic?UI_REFRESH_SEC=2</code>). For SSE live mode use <code>/classic</code> (no refresh).</div>
     </div>
 
     __DB_ERROR__
@@ -740,7 +745,7 @@ _REACT_HTML_TEMPLATE = """<!doctype html>
 </head>
 <body data-build="__BUILD__" data-mode="__MODE__">
   <header>
-    <h1>GoodWe Control - React</h1>
+    <h1>GoodWe Control</h1>
     <div class="status" id="status">loading…</div>
     <div class="build">build: __BUILD__</div>
   </header>
@@ -754,12 +759,12 @@ _REACT_HTML_TEMPLATE = """<!doctype html>
           <div style="font-size:12px; opacity:0.85;">API: __API_UPSTREAM__</div>
         </div>
         <div class="row">
-          <a class="btn" href="/">Classic UI</a>
+          <a class="btn" href="/classic">Classic UI</a>
           <span class="muted" style="font-size:12px;">Experimental React UI (no build step)</span>
         </div>
       </div>
       <div class="muted" style="font-size:12px; margin-top:8px;">
-        Tip: If you don't have internet access on this network, load React from CDN won't work. In that case use the Classic UI (or we can vendor React locally later).
+        Tip: To run this React UI fully offline, place React UMD files in <code>ui_static/vendor/</code> (see README). This page will try local vendor files first, and only fall back to a CDN if they are missing.
       </div>
     </div>
 
@@ -787,10 +792,56 @@ _REACT_HTML_TEMPLATE = """<!doctype html>
       });
     </script>
 
-    <!-- React from CDN (no build step). If you prefer, we can vendor these locally later. -->
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    <script src="/react_app.js?v=__BUILD__"></script>
+    <script>
+      // Load React/ReactDOM from local vendor files (preferred), then fall back to CDN if missing.
+      (function() {
+        var allowCDN = __CDN_FALLBACK__;
+
+        function load(src, onload, onerror, crossorigin) {
+          var s = document.createElement('script');
+          s.src = src;
+          if (crossorigin) s.crossOrigin = 'anonymous';
+          s.onload = onload;
+          s.onerror = onerror || function(){};
+          document.head.appendChild(s);
+        }
+
+        function bootApp() {
+          load('/react_app.js?v=__BUILD__', function(){}, function(){ bootError('failed to load /react_app.js'); });
+        }
+
+        function cdnOrDie() {
+          if (!allowCDN) {
+            bootError('React vendor files missing and CDN fallback disabled (set UI_REACT_CDN_FALLBACK=1)');
+            return;
+          }
+          loadFromCDN();
+        }
+
+        function loadFromCDN() {
+          load('https://unpkg.com/react@18/umd/react.production.min.js', function() {
+            load('https://unpkg.com/react-dom@18/umd/react-dom.production.min.js', function() {
+              bootApp();
+            }, function() {
+              bootError('failed to load ReactDOM from CDN');
+            }, true);
+          }, function() {
+            bootError('failed to load React from CDN');
+          }, true);
+        }
+
+        // Try local vendor first
+        load('/vendor/react.production.min.js', function() {
+          load('/vendor/react-dom.production.min.js', function() {
+            bootApp();
+          }, function() {
+            cdnOrDie();
+          });
+        }, function() {
+          cdnOrDie();
+        });
+      })();
+    </script>
   </main>
 </body>
 </html>
@@ -798,7 +849,7 @@ _REACT_HTML_TEMPLATE = """<!doctype html>
 
 
 _REACT_APP_JS = r"""(function() {
-  // React globals are loaded via CDN scripts in /react.
+  // React globals are loaded by the HTML loader (vendor first, CDN fallback).
   if (!window.React || !window.ReactDOM) {
     var st = document.getElementById('status');
     if (st) st.textContent = 'React not available (CDN blocked?)';
@@ -939,12 +990,31 @@ function LineChart(props) {
       for (var i = 0; i < series.length; i++) {
         var s = series[i];
         if (!enabled[s.key]) continue;
-        out.push({ key: s.key, name: s.name, color: s.color, points: decimate(s.points, maxPoints) });
+        out.push({ key: s.key, name: s.name, color: s.color, points: decimate(s.points, maxPoints), unit: s.unit, axis: s.axis, dash: s.dash });
       }
       return out;
     }, [series, enabled, maxPoints]);
 
-    var range = useMemo(function() { return computeRange(decimated); }, [decimated]);
+    var leftList = useMemo(function() {
+      var out = [];
+      for (var i = 0; i < decimated.length; i++) {
+        var ax = decimated[i].axis || 'left';
+        if (ax !== 'right') out.push(decimated[i]);
+      }
+      return out;
+    }, [decimated]);
+
+    var rightList = useMemo(function() {
+      var out = [];
+      for (var i = 0; i < decimated.length; i++) {
+        var ax = decimated[i].axis || 'left';
+        if (ax === 'right') out.push(decimated[i]);
+      }
+      return out;
+    }, [decimated]);
+
+    var rangeLeft = useMemo(function() { return computeRange(leftList.length ? leftList : decimated); }, [leftList, decimated]);
+    var rangeRight = useMemo(function() { return rightList.length ? computeRange(rightList) : null; }, [rightList]);
     var xRange = useMemo(function() { return computeXRange(decimated); }, [decimated]);
 
     function xOfTs(ts) {
@@ -953,8 +1023,14 @@ function LineChart(props) {
       return clamp(t, 0, 1) * 1000.0;
     }
 
-    function yOf(y) {
-      var t = (y - range.minY) / (range.maxY - range.minY);
+    function _rangeFor(axis) {
+      if (axis === 'right' && rangeRight) return rangeRight;
+      return rangeLeft;
+    }
+
+    function yOf(y, axis) {
+      var r = _rangeFor(axis || 'left');
+      var t = (y - r.minY) / (r.maxY - r.minY);
       t = 1.0 - t;
       return clamp(t, 0, 1) * (height - 20) + 10; // padding
     }
@@ -980,7 +1056,7 @@ function LineChart(props) {
       var p = '';
       for (var i = 0; i < pts.length; i++) {
         var x = xOfTs(pts[i][0]);
-        var y = yOf(pts[i][1]);
+        var y = yOf(pts[i][1], decimated[s].axis);
         p += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
       }
       paths.push(e('path', {
@@ -989,13 +1065,14 @@ function LineChart(props) {
         fill: 'none',
         stroke: decimated[s].color || 'rgba(255,255,255,0.55)',
         strokeWidth: 2,
+        strokeDasharray: decimated[s].dash || null,
         vectorEffect: 'non-scaling-stroke'
       }));
     }
 
     var zeroLine = null;
-    if (showZero && range.minY < 0 && range.maxY > 0) {
-      var zy = yOf(0);
+    if (showZero && rangeLeft.minY < 0 && rangeLeft.maxY > 0) {
+      var zy = yOf(0, 'left');
       zeroLine = e('line', { x1: 0, y1: zy, x2: 1000, y2: zy, stroke: 'rgba(255,255,255,0.18)', strokeWidth: 1, vectorEffect: 'non-scaling-stroke' });
     }
 
@@ -1003,8 +1080,8 @@ function LineChart(props) {
     for (var j = 0; j < yLines.length; j++) {
       var yl = yLines[j];
       if (yl.y === null || yl.y === undefined || isNaN(yl.y)) continue;
-      if (yl.y < range.minY || yl.y > range.maxY) continue;
-      var ly = yOf(yl.y);
+      if (yl.y < rangeLeft.minY || yl.y > rangeLeft.maxY) continue;
+      var ly = yOf(yl.y, 'left');
       var col = (yl.kind === 'bad') ? 'rgba(248,81,73,0.60)' : (yl.kind === 'warn') ? 'rgba(245,159,0,0.55)' : 'rgba(255,255,255,0.22)';
       yLineEls.push(e('line', { key: 'yl_' + j, x1: 0, y1: ly, x2: 1000, y2: ly, stroke: col, strokeWidth: 1, vectorEffect: 'non-scaling-stroke' }));
       if (yl.label) {
@@ -1044,7 +1121,7 @@ function LineChart(props) {
       for (var s2 = 0; s2 < decimated.length; s2++) {
         var np = nearestPoint(decimated[s2].points, hoverTs);
         var val = np ? np[1] : null;
-        lines.push(decimated[s2].name + ': ' + fmt(val, yUnit));
+        lines.push(decimated[s2].name + ': ' + fmt(val, decimated[s2].unit || yUnit));
       }
 
       // include any markers at (roughly) this timestamp
@@ -1649,6 +1726,7 @@ function EventTable(props) {
       var powerLoad = ptsOf(['sources','alpha','pload_w']);
       var powerGrid = ptsOf(['sources','alpha','pgrid_w']);
       var powerBat = ptsOf(['sources','alpha','pbat_w']);
+      var socPct = ptsOf(['sources','alpha','soc_pct']);
 
       var priceImport = ptsOf(['sources','amber','import_c']);
       var priceFeed = ptsOf(['sources','amber','feedin_c']);
@@ -1730,7 +1808,7 @@ function EventTable(props) {
       return e('div', { style: { display: 'grid', gap: '12px' } },
         e(LineChart, {
           title: 'Power flows',
-          subtitle: 'GoodWe gen, Alpha load/grid/battery (' + range + ' view)',
+          subtitle: 'GoodWe gen, Alpha load/grid/battery + SOC% (' + range + ' view)',
           yUnit: 'W',
           showZero: true,
           markers: showMarkers ? markers : [],
@@ -1739,6 +1817,7 @@ function EventTable(props) {
             { key: 'load', name: 'pload_w', color: 'rgba(167,231,131,0.85)', points: powerLoad },
             { key: 'grid', name: 'pgrid_w', color: 'rgba(245,159,0,0.85)', points: powerGrid },
             { key: 'bat', name: 'pbat_w', color: 'rgba(248,81,73,0.85)', points: powerBat },
+            { key: 'soc', name: 'soc_pct', color: 'rgba(230,237,243,0.70)', points: socPct, unit: '%', axis: 'right', dash: '5 4' },
           ]
         }),
         e(LineChart, {
@@ -1838,310 +1917,6 @@ function EventTable(props) {
   }
 })();"""
 
-
-
-
-
-_CHARTJS_HTML_TEMPLATE = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta http-equiv="Cache-Control" content="no-store" />
-  <meta http-equiv="Pragma" content="no-cache" />
-  <title>GoodWe Control - Chart.js</title>
-  <style>
-    :root {
-      --bg: #0b0f14;
-      --panel: #0f1723;
-      --border: #202938;
-      --text: #e6edf3;
-      --muted: rgba(230,237,243,0.72);
-    }
-    body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-    header { padding: 12px 16px; border-bottom: 1px solid var(--border); display:flex; align-items: baseline; gap: 12px; }
-    header h1 { font-size: 16px; margin: 0; font-weight: 600; }
-    header .status { font-size: 12px; opacity: 0.85; }
-    header .build { margin-left: auto; opacity: 0.55; font-size: 11px; }
-    main { padding: 16px; display: grid; gap: 12px; }
-    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
-    .row { display:flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-    .btn { border: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--text); border-radius: 8px; padding: 6px 10px; cursor:pointer; font-size: 12px; text-decoration:none; }
-    .btn:hover { background: rgba(255,255,255,0.04); }
-    .sel { border: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--text); border-radius: 8px; padding: 6px 10px; font-size: 12px; }
-    .muted { color: var(--muted); }
-    canvas { width: 100% !important; height: 280px !important; }
-    pre { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; white-space: pre; max-height: 160px; overflow:auto; }
-  </style>
-</head>
-<body data-build="__BUILD__">
-  <header>
-    <h1>GoodWe Control - Chart.js</h1>
-    <div class="status" id="status">loading…</div>
-    <div class="build">build: __BUILD__</div>
-  </header>
-
-  <main>
-    <div class="card">
-      <div class="row" style="justify-content:space-between;">
-        <div>
-          <div class="muted" style="font-size:12px;">Mode: __MODE__</div>
-          <div class="muted" style="font-size:12px;">DB: __DB_PATH__</div>
-        </div>
-        <div class="row">
-          <a class="btn" href="/">Classic UI</a>
-          <a class="btn" href="/react">React UI</a>
-          <span class="muted" style="font-size:12px;">Plain HTML + Chart.js example (no build step)</span>
-        </div>
-      </div>
-
-      <div class="row" style="margin-top:8px;">
-        <span class="muted" style="font-size:12px;">View:</span>
-        <select id="range" class="sel">
-          <option value="15m">15m</option>
-          <option value="1h">1h</option>
-          <option value="6h">6h</option>
-          <option value="24h">24h</option>
-        </select>
-        <span class="muted" style="font-size:12px;">(auto-updates via SSE)</span>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2 style="font-size:13px; margin:0 0 8px; opacity:0.9;">Power flows</h2>
-      <canvas id="powerChart"></canvas>
-      <div class="muted" style="font-size:12px; margin-top:6px;">gen_w, pload_w, pgrid_w, pbat_w</div>
-    </div>
-
-    <div class="card">
-      <h2 style="font-size:13px; margin:0 0 8px; opacity:0.9;">Change log (example)</h2>
-      <pre id="log">—</pre>
-    </div>
-
-    <!-- Chart.js from CDN (example). If you need offline use, we can vendor it locally. -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-    <script src="/chartjs_app.js?v=__BUILD__"></script>
-  </main>
-</body>
-</html>
-"""
-
-
-_CHARTJS_APP_JS = r"""(function() {
-  if (!window.Chart) {
-    var st = document.getElementById('status');
-    if (st) st.textContent = 'Chart.js not available (CDN blocked?)';
-    return;
-  }
-
-  function $(id) { return document.getElementById(id); }
-
-  function tsLabel(ms) {
-    if (!ms) return '—';
-    try { return new Date(ms).toLocaleTimeString(); }
-    catch (_) { return String(ms); }
-  }
-
-  function logLine(s) {
-    var el = $('log');
-    if (!el) return;
-    if (el.textContent === '—') el.textContent = '';
-    el.textContent += tsLabel(Date.now()) + '  ' + s + '\\n';
-    el.scrollTop = el.scrollHeight;
-    // cap log
-    var lines = el.textContent.split('\\n');
-    if (lines.length > 120) el.textContent = lines.slice(lines.length - 120).join('\\n');
-  }
-
-  function get(obj, path, def) {
-    try {
-      var cur = obj;
-      for (var i = 0; i < path.length; i++) {
-        if (cur === null || cur === undefined) return def;
-        cur = cur[path[i]];
-      }
-      return (cur === undefined) ? def : cur;
-    } catch (_) { return def; }
-  }
-
-  function evTs(ev) {
-    var ts = get(ev, ['ts_epoch_ms'], null);
-    if (!ts) ts = get(get(ev, ['data'], {}), ['ts_epoch_ms'], null);
-    return ts ? Number(ts) : null;
-  }
-
-  function extract(ev) {
-    var d = ev.data || {};
-    return {
-      ts: evTs(ev),
-      gen: get(d, ['sources','goodwe','gen_w'], null),
-      load: get(d, ['sources','alpha','pload_w'], null),
-      grid: get(d, ['sources','alpha','pgrid_w'], null),
-      bat: get(d, ['sources','alpha','pbat_w'], null),
-      reason: get(d, ['decision','reason'], null),
-      id: ev.id || 0
-    };
-  }
-
-  function fetchJSON(url) {
-    return fetch(url, { cache: 'no-store' }).then(function(r) {
-      if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
-      return r.json();
-    });
-  }
-
-  var ctx = $('powerChart').getContext('2d');
-  var powerChart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      datasets: [
-        { label: 'gen_w', data: [], parsing: false },
-        { label: 'pload_w', data: [], parsing: false },
-        { label: 'pgrid_w', data: [], parsing: false },
-        { label: 'pbat_w', data: [], parsing: false },
-      ]
-    },
-    options: {
-      animation: false,
-      responsive: true,
-      interaction: { mode: 'nearest', intersect: false },
-      plugins: {
-        legend: { display: true, labels: { color: '#e6edf3' } },
-        tooltip: {
-          callbacks: {
-            title: function(items) {
-              if (!items || !items.length) return '';
-              return tsLabel(items[0].parsed.x);
-            }
-          }
-        }
-      },
-      scales: {
-        x: {
-          type: 'linear',
-          ticks: {
-            color: 'rgba(230,237,243,0.72)',
-            callback: function(v) { return tsLabel(v); },
-            maxTicksLimit: 8
-          },
-          grid: { color: 'rgba(255,255,255,0.07)' }
-        },
-        y: {
-          ticks: { color: 'rgba(230,237,243,0.72)' },
-          grid: { color: 'rgba(255,255,255,0.07)' }
-        }
-      }
-    }
-  });
-
-  var lastId = 0;
-  var es = null;
-  var prevReason = null;
-
-  function windowMs() {
-    var sel = $('range');
-    var v = sel ? sel.value : '15m';
-    if (v === '1h') return 60 * 60 * 1000;
-    if (v === '6h') return 6 * 60 * 60 * 1000;
-    if (v === '24h') return 24 * 60 * 60 * 1000;
-    return 15 * 60 * 1000;
-  }
-
-  function prune() {
-    var w = windowMs();
-    var now = Date.now();
-    var minX = now - w;
-    for (var i = 0; i < powerChart.data.datasets.length; i++) {
-      var ds = powerChart.data.datasets[i];
-      while (ds.data.length && ds.data[0].x < minX) ds.data.shift();
-    }
-  }
-
-  function addPoint(ts, vals) {
-    if (!ts) return;
-    powerChart.data.datasets[0].data.push({ x: ts, y: Number(vals.gen) });
-    powerChart.data.datasets[1].data.push({ x: ts, y: Number(vals.load) });
-    powerChart.data.datasets[2].data.push({ x: ts, y: Number(vals.grid) });
-    powerChart.data.datasets[3].data.push({ x: ts, y: Number(vals.bat) });
-    prune();
-    powerChart.update('none');
-  }
-
-  function setStatus(s) {
-    var st = $('status');
-    if (st) st.textContent = s;
-  }
-
-  function connectSSE() {
-    if (es) { try { es.close(); } catch (_) {} es = null; }
-    var url = '/api/sse/events?after_id=' + String(lastId);
-    setStatus('connecting SSE (after_id=' + String(lastId) + ')');
-    logLine('SSE connect ' + url);
-
-    try { es = new EventSource(url); }
-    catch (e2) { setStatus('EventSource failed: ' + e2); logLine('EventSource failed: ' + e2); return; }
-
-    es.addEventListener('event', function(msg) {
-      try {
-        var ev = JSON.parse(msg.data);
-        var x = extract(ev);
-        if (x.id) lastId = Math.max(lastId, x.id);
-        if (x.ts) addPoint(x.ts, x);
-
-        if (x.reason && x.reason !== prevReason) {
-          logLine('reason → ' + x.reason);
-          prevReason = x.reason;
-        }
-
-        setStatus('connected (last id ' + String(lastId) + ')');
-      } catch (e3) {
-        logLine('SSE parse error: ' + e3);
-      }
-    });
-
-    es.onerror = function() {
-      setStatus('SSE disconnected - retrying…');
-      logLine('SSE disconnected - retrying…');
-      try { es.close(); } catch (_) {}
-      es = null;
-      setTimeout(connectSSE, 2000);
-    };
-  }
-
-  function boot() {
-    setStatus('loading latest…');
-    fetchJSON('/api/events/latest').then(function(lat) {
-      var x = extract(lat);
-      lastId = x.id || 0;
-      prevReason = x.reason;
-      setStatus('loading history…');
-
-      var historyN = 800;
-      var afterId = Math.max(0, lastId - historyN);
-      return fetchJSON('/api/events?after_id=' + String(afterId) + '&limit=' + String(historyN));
-    }).then(function(res) {
-      if (res && res.events) {
-        for (var i = 0; i < res.events.length; i++) {
-          var x = extract(res.events[i]);
-          if (x.id) lastId = Math.max(lastId, x.id);
-          if (x.ts) addPoint(x.ts, x);
-        }
-      }
-      setStatus('api ok (latest id ' + String(lastId) + ') - connecting SSE…');
-      connectSSE();
-    }).catch(function(e2) {
-      setStatus('boot failed: ' + e2);
-      logLine('boot failed: ' + e2);
-    });
-
-    var sel = $('range');
-    if (sel) sel.addEventListener('change', function() { prune(); powerChart.update('none'); });
-  }
-
-  boot();
-})();"""
-
-
 @app.get("/js_ping")
 def js_ping() -> Response:
     # Used by the browser to confirm JS executed.
@@ -2149,8 +1924,41 @@ def js_ping() -> Response:
     return Response(content=b"ok", media_type="text/plain", headers={"cache-control": "no-store"})
 
 
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request) -> HTMLResponse:
+
+def _serve_static_file(abs_path: str, media_type: str) -> Response:
+    """Serve a local file under ui_static/.
+
+    We keep this very small/specific (rather than a generic directory listing) to avoid
+    accidentally exposing files. Missing files return 404 so the UI can fall back to CDN.
+    """
+    if not os.path.isfile(abs_path):
+        return Response(content=b"not found", media_type="text/plain", status_code=404, headers={"cache-control": "no-store"})
+    try:
+        with open(abs_path, "rb") as f:
+            data = f.read()
+    except Exception:
+        logger.exception("static read failed path=%s", abs_path)
+        return Response(content=b"error", media_type="text/plain", status_code=500, headers={"cache-control": "no-store"})
+
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"cache-control": "public, max-age=31536000, immutable"},
+    )
+
+
+@app.get("/vendor/react.production.min.js")
+def vendor_react_prod() -> Response:
+    return _serve_static_file(os.path.join(VENDOR_DIR, "react.production.min.js"), "application/javascript; charset=utf-8")
+
+
+@app.get("/vendor/react-dom.production.min.js")
+def vendor_react_dom_prod() -> Response:
+    return _serve_static_file(os.path.join(VENDOR_DIR, "react-dom.production.min.js"), "application/javascript; charset=utf-8")
+
+
+@app.get("/classic", response_class=HTMLResponse)
+def classic_index(request: Request) -> HTMLResponse:
     refresh_sec = _q_int(request, "refresh", "UI_REFRESH_SEC", "ui_refresh_sec", default=UI_REFRESH_SEC_DEFAULT)
     if refresh_sec is None:
         refresh_sec = UI_REFRESH_SEC_DEFAULT
@@ -2223,45 +2031,28 @@ def index(request: Request) -> HTMLResponse:
 
     return HTMLResponse(content=html_doc, headers={"cache-control": "no-store"})
 
-@app.get("/react", response_class=HTMLResponse)
-def react_index(request: Request) -> HTMLResponse:
-    # Experimental React-based UI (served without a build step; React is loaded from a CDN).
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request) -> HTMLResponse:
+    # React-based UI (served without a build step).
     mode = "proxied" if UI_PROXY_API else "direct"
     html_doc = _REACT_HTML_TEMPLATE
     html_doc = html_doc.replace("__BUILD__", BUILD_ID)
     html_doc = html_doc.replace("__MODE__", mode)
     html_doc = html_doc.replace("__DB_PATH__", _html_escape(DB_PATH))
     html_doc = html_doc.replace("__API_UPSTREAM__", _html_escape(API_UPSTREAM))
+    html_doc = html_doc.replace("__CDN_FALLBACK__", "true" if UI_REACT_CDN_FALLBACK else "false")
     return HTMLResponse(content=html_doc, headers={"cache-control": "no-store"})
+
+
+@app.get("/react")
+def react_redirect() -> RedirectResponse:
+    return RedirectResponse(url="/", status_code=307)
 
 
 @app.get("/react_app.js")
 def react_app_js() -> Response:
     return Response(
         content=_REACT_APP_JS,
-        media_type="application/javascript; charset=utf-8",
-        headers={"cache-control": "no-store"},
-    )
-
-
-
-
-
-@app.get("/chartjs", response_class=HTMLResponse)
-def chartjs_index(request: Request) -> HTMLResponse:
-    # Plain HTML + Chart.js example UI (auto-updates via SSE).
-    mode = "proxied" if UI_PROXY_API else "direct"
-    html_doc = _CHARTJS_HTML_TEMPLATE
-    html_doc = html_doc.replace("__BUILD__", BUILD_ID)
-    html_doc = html_doc.replace("__MODE__", mode)
-    html_doc = html_doc.replace("__DB_PATH__", _html_escape(DB_PATH))
-    return HTMLResponse(content=html_doc, headers={"cache-control": "no-store"})
-
-
-@app.get("/chartjs_app.js")
-def chartjs_app_js() -> Response:
-    return Response(
-        content=_CHARTJS_APP_JS,
         media_type="application/javascript; charset=utf-8",
         headers={"cache-control": "no-store"},
     )
