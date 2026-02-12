@@ -281,7 +281,8 @@ ALPHAESS_VERIFY_SSL = _env_bool("ALPHAESS_VERIFY_SSL", True)
 
 # AlphaESS sign conventions (note user's comment: positive means costing money, etc.)
 ALPHAESS_PBAT_POSITIVE_IS_CHARGE = _env_bool("ALPHAESS_PBAT_POSITIVE_IS_CHARGE", True)
-ALPHAESS_PGRID_POSITIVE_IS_IMPORT = _env_bool("ALPHAESS_PGRID_POSITIVE_IS_IMPORT", True)
+ALPHAESS_PGRID_POSITIVE_IS_IMPORT = _env_bool("ALPHAESS_PGRID_POSITIVE_IS_IMPORT", False)
+ALPHAESS_PGRID_AUTODETECT = _env_bool("ALPHAESS_PGRID_AUTODETECT", True)
 
 # AlphaESS idle/charge detection
 ALPHAESS_PBAT_IDLE_THRESHOLD_W = _env_int("ALPHAESS_PBAT_IDLE_THRESHOLD_W", 50)
@@ -324,10 +325,11 @@ ALPHAESS_EXPORT_ALLOW_W = _env_int("ALPHAESS_EXPORT_ALLOW_W", 50)
 # Charge-seeking: when export would cost money, gradually increase the assumed "desired" battery
 # charging power until export rises above ALPHAESS_EXPORT_ALLOW_W, then back off.
 # This avoids locking the PV limit to the *current* measured charge power, which can be too low.
-ALPHAESS_CHARGE_SEEK_ENABLE = _env_bool("ALPHAESS_CHARGE_SEEK_ENABLE", "1")
+ALPHAESS_CHARGE_SEEK_ENABLE = _env_bool("ALPHAESS_CHARGE_SEEK_ENABLE", True)
 ALPHAESS_CHARGE_SEEK_INTERVAL_SEC = _env_float("ALPHAESS_CHARGE_SEEK_INTERVAL_SEC", 10.0)
 ALPHAESS_CHARGE_SEEK_STEP_W = _env_int("ALPHAESS_CHARGE_SEEK_STEP_W", 100)
 ALPHAESS_CHARGE_SEEK_MAX_W = _env_int("ALPHAESS_CHARGE_SEEK_MAX_W", ALPHAESS_AUTO_CHARGE_MAX_W)
+ALPHAESS_CHARGE_SEEK_MAX_OFFSET_W = _env_int("ALPHAESS_CHARGE_SEEK_MAX_OFFSET_W", 1500)
 ALPHAESS_CHARGE_SEEK_MAX_STEP_W = _env_int("ALPHAESS_CHARGE_SEEK_MAX_STEP_W", 2000)
 ALPHAESS_CHARGE_SEEK_REDUCE_GAIN = _env_float("ALPHAESS_CHARGE_SEEK_REDUCE_GAIN", 1.0)
 
@@ -1794,10 +1796,6 @@ def main() -> int:
     charge_seek_w: float = 0.0
     last_seek_update_ts: float = 0.0
 
-    # Charge-seek controller state (helps avoid locking PV limit to current measured charge).
-    charge_seek_w: float = 0.0
-    last_seek_update_ts: float = 0.0
-
 
     try:
         while True:
@@ -1950,34 +1948,86 @@ def main() -> int:
                                 soc_f = None
                         battery_full = (soc_f is not None) and (soc_f >= float(ALPHAESS_FULL_SOC_PCT))
 
-                        # Charge-seek: prevent a stable equilibrium where we *only* allow whatever
-                        # charging power happens to be measured right now. Instead, gently increase
-                        # desired charge until we start to export (then back off). This lets the
-                        # battery take more PV if it is willing, while still keeping export near zero.
+                                                # Decide grid import/export for control.
+                        #
+                        # AlphaESS "pGrid" sign conventions vary by model/firmware and can also be
+                        # misconfigured via ALPHAESS_PGRID_POSITIVE_IS_IMPORT. If autodetect is enabled
+                        # and we have enough information, choose the sign that best matches a simple
+                        # power balance (GoodWe generation - house load - battery power).
+                        grid_import_w_ctrl = int(getattr(alpha_snap, "grid_import_w", 0) or 0)
+                        grid_export_w_ctrl = int(getattr(alpha_snap, "grid_export_w", 0) or 0)
+                        grid_note = ""
+                        if ALPHAESS_PGRID_AUTODETECT and (alpha_snap.pgrid_w_raw is not None):
+                            gen_for_balance = gen_w if gen_w is not None else pv_est_w
+                            if gen_for_balance is not None and (alpha_snap.pbat_w is not None):
+                                try:
+                                    pred_net_export_w = int(gen_for_balance) - int(pload_w) - int(alpha_snap.pbat_w)
+                                    cand1_net_export_w = int(grid_export_w_ctrl) - int(grid_import_w_ctrl)
+                                    cand2_net_export_w = -cand1_net_export_w
+                                    # Pick the candidate closer to the predicted net export.
+                                    if abs(pred_net_export_w) >= 200 and (
+                                        abs(cand1_net_export_w - pred_net_export_w)
+                                        > (abs(cand2_net_export_w - pred_net_export_w) + 50)
+                                    ):
+                                        grid_import_w_ctrl, grid_export_w_ctrl = grid_export_w_ctrl, grid_import_w_ctrl
+                                        grid_note = " pgrid_sign=flip"
+                                except Exception:
+                                    pass
+
+                        # Charge-seek: treat charge_seek_w as an *offset* above measured charge.
+                        # This avoids locking the PV limit to a possibly-underreported measured charge
+                        # value, while still backing off when export starts to appear.
                         if battery_full:
                             charge_seek_w = 0.0
-                        elif ALPHAESS_CHARGE_SEEK_ENABLE and alpha_snap.pgrid_w is not None:
-                            if charge_seek_w < float(measured_charge_w):
-                                charge_seek_w = float(measured_charge_w)
+                        elif ALPHAESS_CHARGE_SEEK_ENABLE and (alpha_snap.pgrid_w_raw is not None):
+                            if charge_seek_w < 0.0:
+                                charge_seek_w = 0.0
+
+                            # Max offset: never allow seeking to run away.
+                            max_offset_w = float(ALPHAESS_CHARGE_SEEK_MAX_OFFSET_W)
+                            try:
+                                max_desired_w = float(ALPHAESS_CHARGE_SEEK_MAX_W)
+                                if max_desired_w > 0:
+                                    max_offset_w = min(max_offset_w, max(0.0, max_desired_w - float(measured_charge_w)))
+                            except Exception:
+                                pass
+
+                            # As the battery approaches full, reduce max offset to avoid thrashing.
+                            if soc_f is not None:
+                                if soc_f >= 97.0:
+                                    max_offset_w = min(max_offset_w, 200.0)
+                                elif soc_f >= 95.0:
+                                    max_offset_w = min(max_offset_w, 500.0)
 
                             now_ts = time.time()
                             if (now_ts - last_seek_update_ts) >= float(ALPHAESS_CHARGE_SEEK_INTERVAL_SEC):
                                 last_seek_update_ts = now_ts
-                                export_w = float(alpha_snap.grid_export_w)
+                                export_w = float(grid_export_w_ctrl)
                                 allow_w = float(ALPHAESS_EXPORT_ALLOW_W)
+
                                 if export_w > allow_w:
                                     excess = export_w - allow_w
-                                    reduce_w = min(float(ALPHAESS_CHARGE_SEEK_MAX_STEP_W), excess * float(ALPHAESS_CHARGE_SEEK_REDUCE_GAIN))
+                                    reduce_w = min(
+                                        float(ALPHAESS_CHARGE_SEEK_MAX_STEP_W),
+                                        excess * float(ALPHAESS_CHARGE_SEEK_REDUCE_GAIN),
+                                    )
                                     charge_seek_w = max(0.0, charge_seek_w - reduce_w)
-                            else:
-                                if battery_is_charging:
-                                    inc_w = min(float(ALPHAESS_CHARGE_SEEK_MAX_STEP_W), float(ALPHAESS_CHARGE_SEEK_STEP_W))
-                                    charge_seek_w = min(float(ALPHAESS_CHARGE_SEEK_MAX_W), charge_seek_w + inc_w)
+                                else:
+                                    inc_w = min(
+                                        float(ALPHAESS_CHARGE_SEEK_MAX_STEP_W),
+                                        float(ALPHAESS_CHARGE_SEEK_STEP_W),
+                                    )
+                                    if inc_w > 0:
+                                        charge_seek_w = min(max_offset_w, charge_seek_w + inc_w)
 
-                            desired_charge_w = int(round(max(charge_seek_w, float(measured_charge_w))))
-                            seek_dbg = f" seek={int(round(charge_seek_w))}W exp={int(round(alpha_snap.grid_export_w))}W allow={int(ALPHAESS_EXPORT_ALLOW_W)}W"
+                            charge_seek_w = min(max_offset_w, max(0.0, charge_seek_w))
+                            desired_charge_w = int(round(max(0.0, float(measured_charge_w) + charge_seek_w)))
+                            seek_dbg = (
+                                f" seek_off={int(round(charge_seek_w))}W exp={int(round(grid_export_w_ctrl))}W "
+                                f"allow={int(ALPHAESS_EXPORT_ALLOW_W)}W{grid_note}"
+                            )
 
-                        # Optional: if SOC is low and the battery appears *not charging*, leave headroom
+# Optional: if SOC is low and the battery appears *not charging*, leave headroom
                         # for it to begin charging (prevents a "never starts charging" equilibrium).
                         # IMPORTANT: don't force this headroom once the battery is already charging,
                         # otherwise near-full tapering (e.g. 500W at 95% SOC) can cause large exports.
@@ -1998,8 +2048,8 @@ def main() -> int:
 
                         if alpha_snap.pgrid_w is not None:
                             # If importing, allow more PV; if exporting, back PV off.
-                            target_w_f += ALPHAESS_GRID_FEEDBACK_GAIN * float(alpha_snap.grid_import_w)
-                            target_w_f -= ALPHAESS_GRID_FEEDBACK_GAIN * float(alpha_snap.grid_export_w)
+                            target_w_f += ALPHAESS_GRID_FEEDBACK_GAIN * float(grid_import_w_ctrl)
+                            target_w_f -= ALPHAESS_GRID_FEEDBACK_GAIN * float(grid_export_w_ctrl)
 
                             # Bias toward importing to avoid tiny accidental exports.
                             # Apply the bias only when the battery is full; otherwise it can encourage
