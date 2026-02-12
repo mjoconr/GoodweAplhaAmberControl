@@ -316,6 +316,22 @@ ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT = _env_float("ALPHAESS_AUTO_CHARGE_BELOW_SOC_
 ALPHAESS_AUTO_CHARGE_W = _env_int("ALPHAESS_AUTO_CHARGE_W", 1500)
 ALPHAESS_AUTO_CHARGE_MAX_W = _env_int("ALPHAESS_AUTO_CHARGE_MAX_W", 3000)
 
+# Allow a small amount of export (in watts) when export would cost money.
+# This helps avoid control dead-bands and gives the battery a chance to increase its charge rate
+# if it is currently tapering.
+ALPHAESS_EXPORT_ALLOW_W = _env_int("ALPHAESS_EXPORT_ALLOW_W", 50)
+
+# Charge-seeking: when export would cost money, gradually increase the assumed "desired" battery
+# charging power until export rises above ALPHAESS_EXPORT_ALLOW_W, then back off.
+# This avoids locking the PV limit to the *current* measured charge power, which can be too low.
+ALPHAESS_CHARGE_SEEK_ENABLE = _env_bool("ALPHAESS_CHARGE_SEEK_ENABLE", "1")
+ALPHAESS_CHARGE_SEEK_INTERVAL_SEC = _env_float("ALPHAESS_CHARGE_SEEK_INTERVAL_SEC", 10.0)
+ALPHAESS_CHARGE_SEEK_STEP_W = _env_int("ALPHAESS_CHARGE_SEEK_STEP_W", 100)
+ALPHAESS_CHARGE_SEEK_MAX_W = _env_int("ALPHAESS_CHARGE_SEEK_MAX_W", ALPHAESS_AUTO_CHARGE_MAX_W)
+ALPHAESS_CHARGE_SEEK_MAX_STEP_W = _env_int("ALPHAESS_CHARGE_SEEK_MAX_STEP_W", 2000)
+ALPHAESS_CHARGE_SEEK_REDUCE_GAIN = _env_float("ALPHAESS_CHARGE_SEEK_REDUCE_GAIN", 1.0)
+
+
 # -------------------- Amber --------------------
 
 
@@ -1774,6 +1790,14 @@ def main() -> int:
     last_amber_interval_end_iso: Optional[str] = None
     last_alpha_sig: Optional[Tuple[Any, ...]] = None
 
+    # Charge-seek controller state (helps avoid locking PV limit to current measured charge).
+    charge_seek_w: float = 0.0
+    last_seek_update_ts: float = 0.0
+
+    # Charge-seek controller state (helps avoid locking PV limit to current measured charge).
+    charge_seek_w: float = 0.0
+    last_seek_update_ts: float = 0.0
+
 
     try:
         while True:
@@ -1908,6 +1932,8 @@ def main() -> int:
                         measured_charge_w = int(alpha_snap.charge_w or 0)
                         desired_charge_w = int(measured_charge_w)
 
+                        seek_dbg = ""
+
                         batt_state = str(getattr(alpha_snap, "batt_state", "") or "").strip().lower()
                         battery_is_charging = (batt_state == "charging") and (
                             measured_charge_w >= int(ALPHAESS_PBAT_IDLE_THRESHOLD_W)
@@ -1923,6 +1949,33 @@ def main() -> int:
                             except Exception:
                                 soc_f = None
                         battery_full = (soc_f is not None) and (soc_f >= float(ALPHAESS_FULL_SOC_PCT))
+
+                        # Charge-seek: prevent a stable equilibrium where we *only* allow whatever
+                        # charging power happens to be measured right now. Instead, gently increase
+                        # desired charge until we start to export (then back off). This lets the
+                        # battery take more PV if it is willing, while still keeping export near zero.
+                        if battery_full:
+                            charge_seek_w = 0.0
+                        elif ALPHAESS_CHARGE_SEEK_ENABLE and alpha_snap.pgrid_w is not None:
+                            if charge_seek_w < float(measured_charge_w):
+                                charge_seek_w = float(measured_charge_w)
+
+                            now_ts = time.time()
+                            if (now_ts - last_seek_update_ts) >= float(ALPHAESS_CHARGE_SEEK_INTERVAL_SEC):
+                                last_seek_update_ts = now_ts
+                                export_w = float(alpha_snap.grid_export_w)
+                                allow_w = float(ALPHAESS_EXPORT_ALLOW_W)
+                                if export_w > allow_w:
+                                    excess = export_w - allow_w
+                                    reduce_w = min(float(ALPHAESS_CHARGE_SEEK_MAX_STEP_W), excess * float(ALPHAESS_CHARGE_SEEK_REDUCE_GAIN))
+                                    charge_seek_w = max(0.0, charge_seek_w - reduce_w)
+                            else:
+                                if battery_is_charging:
+                                    inc_w = min(float(ALPHAESS_CHARGE_SEEK_MAX_STEP_W), float(ALPHAESS_CHARGE_SEEK_STEP_W))
+                                    charge_seek_w = min(float(ALPHAESS_CHARGE_SEEK_MAX_W), charge_seek_w + inc_w)
+
+                            desired_charge_w = int(round(max(charge_seek_w, float(measured_charge_w))))
+                            seek_dbg = f" seek={int(round(charge_seek_w))}W exp={int(round(alpha_snap.grid_export_w))}W allow={int(ALPHAESS_EXPORT_ALLOW_W)}W"
 
                         # Optional: if SOC is low and the battery appears *not charging*, leave headroom
                         # for it to begin charging (prevents a "never starts charging" equilibrium).
@@ -1957,7 +2010,7 @@ def main() -> int:
                         target_w = int(round(max(0.0, min(float(GOODWE_RATED_W), target_w_f))))
                         target_reason = f"pload={pload_w}W charge={desired_charge_w}W(meas={measured_charge_w}W)" + (
                             f"(auto+{auto_add_w}W)" if auto_add_w else ""
-                        ) + (f" full={battery_full} bias={bias_w}W" if alpha_snap.pgrid_w is not None else f" full={battery_full}")
+                        ) + (f" full={battery_full} bias={bias_w}W" if alpha_snap.pgrid_w is not None else f" full={battery_full}") + seek_dbg
                 else:
                     target_w = int(GOODWE_RATED_W)
                     target_reason = "export_allowed"

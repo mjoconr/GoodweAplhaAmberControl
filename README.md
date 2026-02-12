@@ -101,6 +101,29 @@ Optional “auto charge headroom” (helps charging start / continue when the ba
   * It will **not** keep forcing extra headroom once the battery is already charging — important near full SOC where the battery naturally tapers charge power.
 * Set `ALPHAESS_AUTO_CHARGE_W=0` to disable this behaviour.
 
+
+### Charge-seek (recommended)
+
+When **export would cost money**, using `measured_charge` as the desired charge rate can "lock" the PV limit at whatever the battery happens to be charging at (e.g. 55 W), even though the battery could accept more if you briefly provide additional surplus.
+
+The **charge-seek** loop avoids that by maintaining a slowly-adapting desired charge estimate (`charge_seek_w`):
+
+* If the battery is charging and grid export is **at/below** `ALPHAESS_EXPORT_ALLOW_W`, it gently increases the desired charge (and thus the PV limit).
+* If grid export rises **above** `ALPHAESS_EXPORT_ALLOW_W`, it backs the desired charge down quickly.
+* When the battery is full, it resets to 0.
+
+Tune with:
+
+* `ALPHAESS_EXPORT_ALLOW_W` (default 50) — set to `0` for *strict* zero-export behaviour.
+* `ALPHAESS_CHARGE_SEEK_INTERVAL_SEC` (default 10)
+* `ALPHAESS_CHARGE_SEEK_STEP_W` (default 100)
+* `ALPHAESS_CHARGE_SEEK_MAX_W` (default = `ALPHAESS_AUTO_CHARGE_MAX_W`)
+* `ALPHAESS_CHARGE_SEEK_MAX_STEP_W` (default 2000)
+* `ALPHAESS_CHARGE_SEEK_REDUCE_GAIN` (default 1.0)
+
+If you see export spikes, reduce `ALPHAESS_CHARGE_SEEK_STEP_W` and/or increase `ALPHAESS_CHARGE_SEEK_INTERVAL_SEC`.
+
+
 ## When export does NOT cost money
 
 If `export_costs=False`, the controller requests **100% output**.
