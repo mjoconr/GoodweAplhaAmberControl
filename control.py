@@ -1899,9 +1899,19 @@ def main() -> int:
                         target_w = 0
                         target_reason = "alpha_stale" if alpha_poller else "alpha_disabled"
                     else:
+                        # AlphaESS occasionally reports transient negative load power.
+                        # Treat load as non-negative so we don't accidentally *increase* export.
                         pload_w = int(alpha_snap.pload_w or 0)
+                        if pload_w < 0:
+                            pload_w = 0
+
                         measured_charge_w = int(alpha_snap.charge_w or 0)
                         desired_charge_w = int(measured_charge_w)
+
+                        batt_state = str(getattr(alpha_snap, "batt_state", "") or "").strip().lower()
+                        battery_is_charging = (batt_state == "charging") and (
+                            measured_charge_w >= int(ALPHAESS_PBAT_IDLE_THRESHOLD_W)
+                        )
 
                         # Determine whether the battery is effectively full.
                         # When the battery is not full, biasing to import can cause SmartShift to discharge
@@ -1914,15 +1924,17 @@ def main() -> int:
                                 soc_f = None
                         battery_full = (soc_f is not None) and (soc_f >= float(ALPHAESS_FULL_SOC_PCT))
 
-                        # Optional: if SOC is low and the battery appears idle, leave headroom
+                        # Optional: if SOC is low and the battery appears *not charging*, leave headroom
                         # for it to begin charging (prevents a "never starts charging" equilibrium).
+                        # IMPORTANT: don't force this headroom once the battery is already charging,
+                        # otherwise near-full tapering (e.g. 500W at 95% SOC) can cause large exports.
                         auto_add_w = 0
                         if (
                             alpha_snap.soc_pct is not None
                             and ALPHAESS_AUTO_CHARGE_W > 0
                             and ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT > 0
                         ):
-                            if soc_f is not None and soc_f < float(ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT):
+                            if (soc_f is not None) and (soc_f < float(ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT)) and (not battery_is_charging):
                                 cap = int(max(0, min(int(ALPHAESS_AUTO_CHARGE_W), int(ALPHAESS_AUTO_CHARGE_MAX_W))))
                                 if cap > desired_charge_w:
                                     auto_add_w = int(cap - desired_charge_w)
@@ -1943,7 +1955,7 @@ def main() -> int:
                             target_w_f -= float(bias_w)
 
                         target_w = int(round(max(0.0, min(float(GOODWE_RATED_W), target_w_f))))
-                        target_reason = f"pload={pload_w}W charge={desired_charge_w}W" + (
+                        target_reason = f"pload={pload_w}W charge={desired_charge_w}W(meas={measured_charge_w}W)" + (
                             f"(auto+{auto_add_w}W)" if auto_add_w else ""
                         ) + (f" full={battery_full} bias={bias_w}W" if alpha_snap.pgrid_w is not None else f" full={battery_full}")
                 else:

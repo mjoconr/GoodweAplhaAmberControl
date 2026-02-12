@@ -96,8 +96,9 @@ This naturally does what you want near full battery: as the battery charge taper
 
 Optional “auto charge headroom” (helps charging start / continue when the battery isn’t full):
 
-* If `SOC < ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT` and `ALPHAESS_AUTO_CHARGE_W > 0`, the controller will assume the battery can absorb up to `ALPHAESS_AUTO_CHARGE_W` (clamped by `ALPHAESS_AUTO_CHARGE_MAX_W`) and will leave PV headroom accordingly.
-  * Default `ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT` tracks `ALPHAESS_FULL_SOC_PCT` so this behaviour continues up until “full”.
+* If `SOC < ALPHAESS_AUTO_CHARGE_BELOW_SOC_PCT` and `ALPHAESS_AUTO_CHARGE_W > 0`, the controller will assume the battery can absorb up to `ALPHAESS_AUTO_CHARGE_W` (clamped by `ALPHAESS_AUTO_CHARGE_MAX_W`) **only when the battery is idle/discharging** and will leave PV headroom accordingly.
+  * This is intentionally a **kick‑start** (avoids a “never starts charging” equilibrium).
+  * It will **not** keep forcing extra headroom once the battery is already charging — important near full SOC where the battery naturally tapers charge power.
 * Set `ALPHAESS_AUTO_CHARGE_W=0` to disable this behaviour.
 
 ## When export does NOT cost money
