@@ -306,6 +306,15 @@ ALPHAESS_GRID_FEEDBACK_GAIN = _env_float("ALPHAESS_GRID_FEEDBACK_GAIN", 1.0)
 ALPHAESS_GRID_IMPORT_BIAS_W = _env_int("ALPHAESS_GRID_IMPORT_BIAS_W", 50)
 ALPHAESS_GRID_IMPORT_BIAS_W_WHEN_NOT_FULL = _env_int("ALPHAESS_GRID_IMPORT_BIAS_W_WHEN_NOT_FULL", 0)
 
+# When export would cost money and SmartShift is active, intentionally biasing to *import*
+# can cause the battery to discharge to cancel that import (even when SOC is 100%).
+# This setting disables the import-bias and boosts the PV limit a little when we observe
+# the battery discharging while 'export_costs=True' and SOC is full.
+ALPHAESS_AVOID_DISCHARGE_WHEN_FULL = _env_bool("ALPHAESS_AVOID_DISCHARGE_WHEN_FULL", True)
+# Cap for the above boost (W). Keep this modest; exporting a little is usually cheaper than
+# discharging and later re-charging from the grid.
+ALPHAESS_AVOID_DISCHARGE_BOOST_MAX_W = _env_int("ALPHAESS_AVOID_DISCHARGE_BOOST_MAX_W", 300)
+
 
 # Battery considered "full" at/above this SOC percentage.
 # Many systems only report SOC as an integer, so use 99.5 by default to treat 100% as full.
@@ -1725,7 +1734,9 @@ def main() -> int:
         f"auto_charge_w={ALPHAESS_AUTO_CHARGE_W}W auto_charge_max_w={ALPHAESS_AUTO_CHARGE_MAX_W}W "
         f"full_soc={ALPHAESS_FULL_SOC_PCT}% "
         f"grid_import_bias_full={ALPHAESS_GRID_IMPORT_BIAS_W}W "
-        f"grid_import_bias_not_full={ALPHAESS_GRID_IMPORT_BIAS_W_WHEN_NOT_FULL}W"
+        f"grid_import_bias_not_full={ALPHAESS_GRID_IMPORT_BIAS_W_WHEN_NOT_FULL}W "
+        f"avoid_discharge_full={'on' if ALPHAESS_AVOID_DISCHARGE_WHEN_FULL else 'off'} "
+        f"avoid_discharge_boost_max={ALPHAESS_AVOID_DISCHARGE_BOOST_MAX_W}W"
     )
 
     LOG.info(
@@ -2073,15 +2084,45 @@ def main() -> int:
                             target_w_f -= ALPHAESS_GRID_FEEDBACK_GAIN * float(grid_export_w_ctrl)
 
                             # Bias toward importing to avoid tiny accidental exports.
-                            # Apply the bias only when the battery is full; otherwise it can encourage
-                            # SmartShift to discharge to cancel the import we intentionally create.
+                            # NOTE: With SmartShift enabled, intentional import can be cancelled by the
+                            # battery discharging to drive pGrid back toward ~0W. When the battery is full
+                            # and not actively charging, that behaviour is undesirable (it drains the battery),
+                            # so we disable import-bias and (if needed) lift the PV limit slightly.
                             bias_w = int(ALPHAESS_GRID_IMPORT_BIAS_W) if battery_full else int(ALPHAESS_GRID_IMPORT_BIAS_W_WHEN_NOT_FULL)
+
+                            avoid_discharge_w = 0
+                            if (
+                                ALPHAESS_AVOID_DISCHARGE_WHEN_FULL
+                                and battery_full
+                                and (desired_charge_w <= int(ALPHAESS_PBAT_IDLE_THRESHOLD_W))
+                            ):
+                                # When the battery is full and we're not trying to charge it, avoid
+                                # deliberately creating grid import (SmartShift may discharge to cancel it).
+                                bias_w = 0
+
+                                if alpha_snap.pbat_w is not None:
+                                    try:
+                                        pbat_i = int(alpha_snap.pbat_w)
+                                    except Exception:
+                                        pbat_i = 0
+                                    # If the battery is still discharging meaningfully while we are in export_costs mode,
+                                    # lift the PV limit (even if it causes a small export) rather than draining the battery
+                                    # and later having to re-charge from the grid.
+                                    if pbat_i <= -int(ALPHAESS_PBAT_IDLE_THRESHOLD_W):
+                                        avoid_discharge_w = int(
+                                            min(int(ALPHAESS_AVOID_DISCHARGE_BOOST_MAX_W), max(0, -pbat_i))
+                                        )
+                                        if avoid_discharge_w > 0:
+                                            target_w_f += float(avoid_discharge_w)
+
                             target_w_f -= float(bias_w)
 
                         target_w = int(round(max(0.0, min(float(GOODWE_RATED_W), target_w_f))))
                         target_reason = f"pload={pload_w}W charge={desired_charge_w}W(meas={measured_charge_w}W)" + (
                             f"(auto+{auto_add_w}W)" if auto_add_w else ""
-                        ) + (f" full={battery_full} bias={bias_w}W" if alpha_snap.pgrid_w is not None else f" full={battery_full}") + seek_dbg
+                        ) + (
+                            f" full={battery_full} bias={bias_w}W" if alpha_snap.pgrid_w is not None else f" full={battery_full}"
+                        ) + (f" avoid_discharge=+{avoid_discharge_w}W" if avoid_discharge_w else "") + seek_dbg
                 else:
                     target_w = int(GOODWE_RATED_W)
                     target_reason = "export_allowed"
