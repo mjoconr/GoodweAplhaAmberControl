@@ -224,6 +224,15 @@ GOODWE_ALWAYS_ENABLED = _env_bool("GOODWE_ALWAYS_ENABLED", True)
 # Control loop
 SLEEP_SECONDS = _env_float("SLEEP_SECONDS", 10.0)
 MIN_SECONDS_BETWEEN_WRITES = _env_float("MIN_SECONDS_BETWEEN_WRITES", 10.0)
+# GoodWe write gating
+# When AlphaESS is enabled, you can optionally restrict writes to the GW5000 limit registers
+# to happen only once per new AlphaESS snapshot. This reduces "bouncing" when the control loop
+# runs faster than the AlphaESS polling interval.
+GOODWE_WRITE_AFTER_ALPHA_UPDATE_ONLY = _env_bool("GOODWE_WRITE_AFTER_ALPHA_UPDATE_ONLY", True)
+# Safety/edge-case: allow a write when AlphaESS transitions ok<->stale/offline, even if there
+# is no new snapshot (useful to force a safe limit when Alpha data disappears).
+GOODWE_WRITE_ALLOW_ON_ALPHA_STATE_CHANGE = _env_bool("GOODWE_WRITE_ALLOW_ON_ALPHA_STATE_CHANGE", True)
+
 MIN_PCT_STEP = _env_int("MIN_PCT_STEP", 1)
 LIMIT_SMOOTHING = _env_float("LIMIT_SMOOTHING", 0.2)
 
@@ -1719,6 +1728,12 @@ def main() -> int:
         f"grid_import_bias_not_full={ALPHAESS_GRID_IMPORT_BIAS_W_WHEN_NOT_FULL}W"
     )
 
+    LOG.info(
+        f"[start] goodwe_write_after_alpha_update_only={GOODWE_WRITE_AFTER_ALPHA_UPDATE_ONLY} "
+        f"goodwe_write_allow_on_alpha_state_change={GOODWE_WRITE_ALLOW_ON_ALPHA_STATE_CHANGE} "
+        f"min_seconds_between_writes={MIN_SECONDS_BETWEEN_WRITES}"
+    )
+
     amber = AmberClient(AMBER_SITE_ID, AMBER_API_KEY)
     amber_poller = AmberPoller(
         amber,
@@ -1787,10 +1802,16 @@ def main() -> int:
 
     last_limit_state: Optional[Tuple[int, int]] = None  # (enabled, pct)
     last_write_ts = 0.0
+    last_write_failed = False
     loop_counter = 0
 
     last_amber_interval_end_iso: Optional[str] = None
     last_alpha_sig: Optional[Tuple[Any, ...]] = None
+    # Track AlphaESS updates so we can optionally gate GoodWe writes to *once per new Alpha snapshot*.
+    start_ts = time.time()
+    last_alpha_snapshot_ts: Optional[float] = None
+    last_alpha_ok_state: Optional[bool] = None
+    last_alpha_present_state: Optional[bool] = None
 
     # Charge-seek controller state (helps avoid locking PV limit to current measured charge).
     charge_seek_w: float = 0.0
@@ -2087,7 +2108,56 @@ def main() -> int:
                 want_pct = target_pct
 
                 now = time.time()
-                can_write = (now - last_write_ts) >= float(MIN_SECONDS_BETWEEN_WRITES)
+
+                # --- Write gating ---
+                # Time-based limiter (always active)
+                can_write_time = (now - last_write_ts) >= float(MIN_SECONDS_BETWEEN_WRITES)
+
+                # Optional: when AlphaESS is enabled, only allow one write per new Alpha snapshot.
+                alpha_gate_enabled = bool(GOODWE_WRITE_AFTER_ALPHA_UPDATE_ONLY and alpha_poller is not None)
+                alpha_updated = False
+                alpha_state_changed = False
+                alpha_gate_reason = "time"
+                can_write_gate = True
+
+                if alpha_gate_enabled:
+                    present = alpha_snap is not None
+
+                    if last_alpha_present_state is None:
+                        last_alpha_present_state = present
+                    elif present != last_alpha_present_state:
+                        alpha_state_changed = True
+                        last_alpha_present_state = present
+
+                    if last_alpha_ok_state is None:
+                        last_alpha_ok_state = bool(alpha_ok)
+                    elif bool(alpha_ok) != bool(last_alpha_ok_state):
+                        alpha_state_changed = True
+                        last_alpha_ok_state = bool(alpha_ok)
+
+                    if alpha_snap is not None:
+                        ts_key = float(alpha_snap.ts)
+                        if last_alpha_snapshot_ts is None or ts_key != float(last_alpha_snapshot_ts):
+                            alpha_updated = True
+                            last_alpha_snapshot_ts = ts_key
+
+                    if alpha_updated:
+                        can_write_gate = True
+                        alpha_gate_reason = "alpha_update"
+                    elif alpha_state_changed and GOODWE_WRITE_ALLOW_ON_ALPHA_STATE_CHANGE:
+                        can_write_gate = True
+                        alpha_gate_reason = "alpha_state_change"
+                    else:
+                        can_write_gate = False
+                        alpha_gate_reason = "waiting_alpha_update"
+
+                # If the last write attempt failed, allow a retry even if there is no new Alpha snapshot yet.
+                # (Still obeys MIN_SECONDS_BETWEEN_WRITES via can_write_time.)
+                if alpha_gate_enabled and last_write_failed:
+                    can_write_gate = True
+                    alpha_gate_reason = "retry_after_failure"
+
+                can_write = bool(can_write_time and can_write_gate)
 
                 current_limit = limiter.read_current()
 
@@ -2122,11 +2192,14 @@ def main() -> int:
                         last_limit_state = (want_enabled, want_pct)
                         last_write_ts = now
                         write_ok = True
+                        last_write_failed = False
                     except Exception as e:
                         write_error = str(e)
                         LOG.error(f"  [goodwe] write failed: {e}")
+                        last_write_failed = True
+                        last_write_ts = now
                 elif not can_write and DEBUG:
-                    LOG.debug("  [goodwe] skipping write (rate limited)")
+                    LOG.debug(f"  [goodwe] skipping write (time_ok={can_write_time} gate_ok={can_write_gate} gate={alpha_gate_reason})")
 
                 # ---- Export structured decision event (best effort) ----
                 try:
@@ -2277,6 +2350,12 @@ def main() -> int:
                             'reason': str(target_reason),
                             'need_write': bool(need_write),
                             'can_write': bool(can_write),
+                            'can_write_time': bool(can_write_time),
+                            'can_write_gate': bool(can_write_gate),
+                            'write_gate_mode': 'alpha_update' if alpha_gate_enabled else 'time',
+                            'write_gate_reason': str(alpha_gate_reason),
+                            'alpha_updated': bool(alpha_updated),
+                            'alpha_state_changed': bool(alpha_state_changed),
                         },
                         'actuation': {
                             'write_attempted': bool(write_attempted),
